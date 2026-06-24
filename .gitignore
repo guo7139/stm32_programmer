@@ -9,3 +9,6 @@ __pycache__/
 *.swp
 .DS_Store
 Thumbs.db
+
+# 临时诊断脚本
+f*_diag.py
