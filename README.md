@@ -178,17 +178,19 @@ python stm32_stlink_programmer.py -f firmware.hex --no-verify
 ## 已验证芯片
 
 - STM32H743VGT6（LQFP-100，ID 0x450）— 完整烧录校验通过
+- STM32F1 Medium-density（ID 0x410，如 EH22G PCU 板）— 完整烧录校验通过
 - STM32F76x/77x（ID 0x451）— 完整烧录校验通过
 - STM32F74x/75x（0x449）、STM32F72x/73x（0x452）— 已加支持（同 F7 逻辑）
 - STM32F40x/41x（0x413）、F42x/43x（0x419，含 F427/F429）、F446（0x421）、F411（0x431）等 F4 全系 — 已支持（F4 逻辑，含 2MB 双 bank）
 
-## 当前限制
+## STM32F1 适配要点（踩坑记录）
 
-- **STM32F1（如 ID 0x410）当前不支持通过本工具的 ST-Link 直写方式稳定烧录。**
-  - 现状：F1 的解锁、擦除、读回校验都正常，但 Flash 编程要求真正的 **16-bit 半字写**。
-  - 当前 pyusb + ST-Link V2 通用内存写路径（8-bit/32-bit）无法稳定触发 F1 的半字编程，因此会出现“擦除成功、写入显示完成、校验读回仍是全 FF”的现象。
-  - 后续若要支持，需要单独实现 **F1 专用 SRAM Flash Loader**。
-  - 结论：本工具当前请仅将 F1 视为“可连接/可擦除/可读取，但不可稳定写入”。
+F1（如 ID 0x410）已完整支持烧录。调通过程踩了两个隐蔽坑：
+
+1. **Flash 编程必须用 16-bit 半字写命令**：F1 的 Flash 编程要求真正的半字（16-bit）总线写。ST-Link 通用的 8-bit(WRITEMEM_8BIT=0x0D)/32-bit(WRITEMEM_32BIT=0x08) 写内存命令都**无法触发** F1 的 Flash 编程——表现为“设了 PG 位、SR 显示 EOP、但内容仍是全 FF”。必须使用 **WRITEMEM_16BIT=0x48** 命令逐半字写入。注意 0x47 是 16-bit 读命令，发数据当写命令用会污染端点导致后续超时。
+2. **F1 解锁的 LOCK 位是 bit7（不是 F4/F7 的 bit31）**：之前 flash_unlock 的 else 分支按 F4/F7 写（检查 bit31），F1 复位后 CR=0x80（bit31=0）条件不成立，导致 **F1 从未真正解锁**。Flash 锁定时擦除/编程命令被硬件静默忽略且不报错，于是出现“擦除/写入都显示 100%，校验却读到残留旧数据”。必须为 F1 单独判断 LOCK=bit7 并写 KEYR 解锁。
+3. 编程流程：解锁 → 设 PG(bit0) → 逐半字 write_mem16，每个半字后等 BSY(bit0) 清零并检查 PGERR(bit2)/WRPRTERR(bit4) → 清 PG 位。
+4. 警示：“校验通过”不等于“写入成功”——若目标芯片之前被官方工具烧过相同固件，未真正写入时校验会被旧数据蒙混通过。务必先确认擦除后读回是全 FF。
 
 
 ## STM32H7 适配要点（踩坑记录）
@@ -211,10 +213,11 @@ H7 的 Flash 控制器与 F1/F4 完全不同，移植时注意：
 坑点：
 
 1. 每次必须写满 256-bit（32字节）flash word，不足用 0xFF 补齐，否则触发 INCERR。
-2. PSIZE=3（64-bit 并行度），编程前设 CR1 = PG | (3<<4)。
-3. WRPERR(bit16) 误报：通过 ST-Link 调试器编程时，擦除和编程操作都会误置 WRPERR，但数据实际写入正确（已逐字节验证）。因此 H7 只对致命错误（PGSERR/STRBERR/INCERR）报错，忽略 WRPERR 和 ECC 错误位，每次操作后清 CCR1。
-4. 校验时序：写入完成锁定 Flash 后，校验前要重新 halt CPU + 短延时让 Flash 状态稳定，否则首个 word 可能读到脏数据。读取失败自动重试。
-5. STRBERR(bit18 写突发错误) 偶发：老款 ST-Link V2 固件（如 JTAG v46）写 256-bit word 时，会偶发把单次 word 写入拆成多次总线访问，触发 STRBERR，表现为烧录到中途（如 86%）随机报错。解决方案：每个 word 写入后立即回读比对，不符就清错误标志、重设 PG 位后重写该 word，最多重试 4 次。等于把校验前移到写入环节，既容错又保证数据完整。
+2. **PSIZE=2（32-bit），与官方工具一致**。编程前设 CR1 = PG | (2<<4)。曾误用 PSIZE=3(64-bit)，在 2.1V 供电下会触发 ECC 错误导致写入失败。
+3. **扇区擦除必须用 SER=bit2（不是 bit1）**：H7 CR1 的 bit1 是 PG、bit2 才是 SER。曾误把 (1<<1) 当 SER，等于设了 PG 而非扇区擦除请求，导致**擦除根本没生效**（读回仍是旧数据）。往未擦净的 flash word 上写会触发 DBECCERR(bit25)。擦除请求 CR1 = SER(bit2) | (SNB<<8) | PSIZE | START(bit7)。
+4. WRPERR(bit16) 误报：通过 ST-Link 调试器编程时，擦除和编程操作都会误置 WRPERR，但数据实际写入正确（已逐字节验证）。因此 H7 只对致命错误（PGSERR/STRBERR/INCERR）报错，忽略 WRPERR 和 ECC 错误位，每次操作后清 CCR1。
+5. 校验时序：写入完成锁定 Flash 后，校验前要重新 halt CPU + 短延时让 Flash 状态稳定，否则首个 word 可能读到脏数据。读取失败自动重试。
+6. STRBERR(bit18 写突发错误) 偶发：老款 ST-Link V2 固件（如 JTAG v46）写 256-bit word 时，会偶发把单次 word 写入拆成多次总线访问，触发 STRBERR，表现为烧录到中途（如 86%）随机报错。解决方案：每个 word 写入后立即回读比对，不符就清错误标志、重设 PG 位后重写该 word，最多重试 4 次。等于把校验前移到写入环节，既容错又保证数据完整。
 
 ## STM32F7 适配要点（踩坑记录）
 
