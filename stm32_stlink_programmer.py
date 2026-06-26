@@ -53,6 +53,7 @@ DBG_READCOREID = 0x22
 DBG_RESETSYS = 0x03
 DBG_READMEM32 = 0x07
 DBG_WRITEMEM32 = 0x08
+DBG_WRITEMEM16 = 0x48  # 16-bit 总线写内存，F1 半字编程必需
 DBG_RUNCORE = 0x09
 DBG_HALTCORE = 0x02
 DBG_ENTER_SWD = 0xA3
@@ -364,6 +365,17 @@ class STLink:
         self.dev.write(self._ep_out, cmd, timeout=1000)
         self._write_bulk(data, timeout=1000)
 
+    def write_mem16(self, addr, data):
+        """16-bit 总线写内存 (WRITEMEM_16BIT=0x48)。STM32F0/F1 Flash 半字编程必需，
+        8-bit/32-bit 总线写无法触发 F1 编程。addr 和长度需 2 字节对齐，单次<=64字节。"""
+        cmd = bytearray(16)
+        cmd[0] = CMD_DEBUG
+        cmd[1] = DBG_WRITEMEM16
+        struct.pack_into('<I', cmd, 2, addr)
+        struct.pack_into('<H', cmd, 6, len(data))
+        self.dev.write(self._ep_out, cmd, timeout=1000)
+        self._write_bulk(data, timeout=1000)
+
     def read_reg32(self, addr):
         d = self.read_mem32(addr, 4)
         return struct.unpack_from('<I', d, 0)[0]
@@ -489,7 +501,7 @@ class STM32Programmer:
                     raise STM32Error("H7 Flash Bank1 解锁失败")
             # 清除所有错误标志
             self.stlink.write_reg32(self.flash_base + 0x14, 0x0FEF0000)
-        else:
+        elif self.is_f4 or self.is_f7:
             # F4/F7: 检查LOCK, 若锁定则解锁
             # 关键(F7): 解锁必须在连接后第一时间, 前面不能有FLASH_CR写操作污染状态机
             cr = self.stlink.read_reg32(self.flash_base + self.FLASH_CR)
@@ -499,6 +511,15 @@ class STM32Programmer:
                 cr = self.stlink.read_reg32(self.flash_base + self.FLASH_CR)
                 if cr & 0x80000000:
                     raise STM32Error(f"FLASH 解锁失败 CR=0x{cr:08X} (F7需连接后立即解锁,检查时序)")
+        else:
+            # F0/F1: LOCK = bit7。复位后默认锁定(CR=0x80)，必须解锁否则擦除/编程静默失效。
+            cr = self.stlink.read_reg32(self.flash_base + self.FLASH_CR)
+            if cr & 0x80:  # LOCK bit7
+                self.stlink.write_reg32(self.flash_base + self.FLASH_KEYR, 0x45670123)
+                self.stlink.write_reg32(self.flash_base + self.FLASH_KEYR, 0xCDEF89AB)
+                cr = self.stlink.read_reg32(self.flash_base + self.FLASH_CR)
+                if cr & 0x80:
+                    raise STM32Error(f"F1 FLASH 解锁失败 CR=0x{cr:08X}")
 
     def flash_lock(self):
         if self.is_h7:
@@ -619,16 +640,17 @@ class STM32Programmer:
         # 清除错误标志
         self.stlink.write_reg32(self.flash_base + 0x14, 0x0FEF0000)
         for i in range(first_sector, last_sector + 1):
-            # CR1: SER(bit1)=1 | SNB(bit8:10) | START(bit7)
-            # H7 CR1 bit定义: BER=bit2, SER=bit1, START=bit7, SNB=bit8:10
-            # 确定 bank: sector 0-7 = bank1, 8-15 = bank2
+            # H7 CR1 正确 bit 定义: PG=bit1, SER=bit2, START=bit7,
+            #   PSIZE=bit4:5, SNB=bit8:10。擦除必须用 SER=bit2(之前误用bit1=PG导致擦除不生效)
+            # PSIZE=2 (32-bit, 与官方工具一致)
+            SER = (1 << 2); START = (1 << 7); PSIZE = (2 << 4)
             if i < 8:
-                cr_val = (1 << 1) | (i << 8) | (1 << 7)  # SER | SNB | START
+                cr_val = SER | (i << 8) | PSIZE | START
                 self.stlink.write_reg32(self.flash_base + 0x0C, cr_val)
             else:
                 # Bank 2: base + 0x100 偏移
                 s = i - 8
-                cr_val = (1 << 1) | (s << 8) | (1 << 7)
+                cr_val = SER | (s << 8) | PSIZE | START
                 self.stlink.write_reg32(self.flash_base + 0x10C, cr_val)
             self.flash_wait(timeout=30)
             pct = (i - first_sector + 1) * 100 // n
@@ -749,8 +771,8 @@ class STM32Programmer:
         cr = self.stlink.read_reg32(FB + CR1)
         if cr & 0x01:
             raise STM32Error(f"H7: Flash仍锁定 CR=0x{cr:08X}")
-        # PG=1 | PSIZE=3(64-bit)
-        self.stlink.write_reg32(FB + CR1, (1 << 1) | (3 << 4))
+        # PG=1 | PSIZE=2(32-bit，与官方工具一致；之前用3=64-bit会触发ECC错误)
+        self.stlink.write_reg32(FB + CR1, (1 << 1) | (2 << 4))
         cr = self.stlink.read_reg32(FB + CR1)
         if not (cr & 0x02):
             raise STM32Error(f"H7: PG位设置失败 CR=0x{cr:08X}")
@@ -790,7 +812,7 @@ class STM32Programmer:
                     ok = True
                     break
                 # 数据不符或致命错误，重新设PG后重试
-                self.stlink.write_reg32(FB + CR1, (1 << 1) | (3 << 4))
+                self.stlink.write_reg32(FB + CR1, (1 << 1) | (2 << 4))
             if not ok:
                 raise STM32Error(f"H7: word @ 0x{waddr:08X} 写入失败 (重试4次) SR=0x{sr:08X}")
 
@@ -834,24 +856,36 @@ class STM32Programmer:
         print()
 
     def _write_flash_f1(self, addr, data):
-        """F1/F0: 半字(16-bit) 编程"""
+        """F0/F1: 半字(16-bit) 编程。
+        必须用 WRITEMEM_16BIT(0x48)，8/32-bit 总线写无法触发 F1 Flash 编程。
+        逐半字写，每个半字写后等待 BSY 清零。"""
+        # 长度补齐到偶数（半字对齐），尾部补 0xFF
+        if len(data) % 2:
+            data = data + b'\xFF'
         total = len(data)
-        self.stlink.write_reg32(self.flash_base + self.FLASH_CR, 0x01)  # PG
+        # 设置 PG 位
+        self.stlink.write_reg32(self.flash_base + self.FLASH_CR, 0x01)
         written = 0
-        block = 4
         last_pct = -1
-        while written < total:
-            end = min(written + block, total)
-            chunk = data[written:end]
-            if len(chunk) % 4:
-                chunk = chunk + b'\xFF' * (4 - len(chunk) % 4)
-            self.stlink.write_mem32(addr + written, chunk)
-            self.flash_wait(timeout=1)
-            written = end
-            pct = min(written, total) * 100 // total
-            if pct != last_pct:
-                print(f"\r  写入: {pct}%", end="", flush=True)
-                last_pct = pct
+        try:
+            while written < total:
+                self.stlink.write_mem16(addr + written, data[written:written+2])
+                self.flash_wait(timeout=1)
+                # 检查编程错误（PGERR=bit2, WRPRTERR=bit4）
+                sr = self.stlink.read_reg32(self.flash_base + self.FLASH_SR)
+                if sr & ((1 << 2) | (1 << 4)):
+                    self.stlink.write_reg32(self.flash_base + self.FLASH_SR, sr)
+                    raise STM32Error(
+                        f"F1 编程错误 @ 0x{addr+written:08X} SR=0x{sr:08X} "
+                        f"({'PGERR ' if sr & (1<<2) else ''}{'WRPRTERR' if sr & (1<<4) else ''})")
+                written += 2
+                pct = min(written, total) * 100 // total
+                if pct != last_pct:
+                    print(f"\r  写入: {pct}%", end="", flush=True)
+                    last_pct = pct
+        finally:
+            # 清除 PG 位
+            self.stlink.write_reg32(self.flash_base + self.FLASH_CR, 0x00)
         print()
 
     def verify(self, addr, data):

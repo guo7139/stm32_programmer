@@ -26,6 +26,12 @@ Python 版 `stm32_stlink_programmer.py` 的 C# 移植，功能完全一致，编
 - F4 全系：F40x/41x(0x413)、F42x/43x(0x419 含 F427/F429)、F446(0x421)、F411(0x431) 等 — 已支持
   - 含 2MB 双 bank（F427/F429/F437/F439），bank2 扇区 SNB 从 16 起编码
 
+## 当前限制
+
+- **STM32F1 当前不支持通过本 C# / Python ST-Link 直写方案稳定烧录。**
+  - 原因是 F1 Flash 编程要求真正的 16-bit 半字写，而当前 ST-Link V2 通用 USB 写内存路径不具备稳定的半字编程能力。
+  - 后续若要支持，需要单独实现 F1 专用 SRAM Flash Loader。
+
 ## 双击自动模式（推荐给非命令行用户）
 
 把 exe 和 `firmware.hex`（或 `firmware.bin`）放在**同一目录**，直接双击 exe 即可：

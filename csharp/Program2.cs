@@ -130,7 +130,7 @@ namespace Stm32Prog
                     if ((cr & 0x01) != 0) throw new STM32Error("H7 Flash Bank1 解锁失败");
                 }
             }
-            else
+            else if (isF4 || isF7)
             {
                 // F4/F7: 检查LOCK, 若锁定则解锁
                 // 关键(F7): 解锁必须在连接后第一时间, 前面不能有FLASH_CR写操作污染状态机
@@ -142,6 +142,19 @@ namespace Stm32Prog
                     cr = stlink.ReadReg32(flashBase + FLASH_CR);
                     if ((cr & 0x80000000) != 0)
                         throw new STM32Error($"FLASH 解锁失败 CR=0x{cr:X8} (F7需连接后立即解锁)");
+                }
+            }
+            else
+            {
+                // F0/F1: LOCK = bit7。复位后默认锁定(CR=0x80)，必须解锁否则擦除/编程静默失效。
+                uint cr = stlink.ReadReg32(flashBase + FLASH_CR);
+                if ((cr & 0x80) != 0)
+                {
+                    stlink.WriteReg32(flashBase + FLASH_KEYR, 0x45670123);
+                    stlink.WriteReg32(flashBase + FLASH_KEYR, 0xCDEF89AB);
+                    cr = stlink.ReadReg32(flashBase + FLASH_CR);
+                    if ((cr & 0x80) != 0)
+                        throw new STM32Error($"F1 FLASH 解锁失败 CR=0x{cr:X8}");
                 }
             }
         }
@@ -250,15 +263,18 @@ namespace Stm32Prog
             stlink.WriteReg32(flashBase + 0x14, 0x0FEF0000);
             for (int i = firstSector; i <= lastSector; i++)
             {
+                // H7 CR1 正确 bit 定义: PG=bit1, SER=bit2, START=bit7, PSIZE=bit4:5, SNB=bit8:10
+                // 擦除必须用 SER=bit2(之前误用bit1=PG导致擦除不生效)。PSIZE=2(32-bit,与官方一致)
+                const uint SER = (1u << 2), START = (1u << 7), PSIZE = (2u << 4);
                 if (i < 8)
                 {
-                    uint crVal = (1u << 1) | ((uint)i << 8) | (1u << 7);
+                    uint crVal = SER | ((uint)i << 8) | PSIZE | START;
                     stlink.WriteReg32(flashBase + 0x0C, crVal);
                 }
                 else
                 {
                     uint s = (uint)(i - 8);
-                    uint crVal = (1u << 1) | (s << 8) | (1u << 7);
+                    uint crVal = SER | (s << 8) | PSIZE | START;
                     stlink.WriteReg32(flashBase + 0x10C, crVal);
                 }
                 FlashWait(30);
@@ -382,7 +398,8 @@ namespace Stm32Prog
             stlink.WriteReg32(FB + CCR1, 0x0FFF0000);
             uint cr = stlink.ReadReg32(FB + CR1);
             if ((cr & 0x01) != 0) throw new STM32Error($"H7: Flash仍锁定 CR=0x{cr:X8}");
-            stlink.WriteReg32(FB + CR1, (1u << 1) | (3u << 4));
+            // PG=1 | PSIZE=2(32-bit，与官方工具一致；之前用3=64-bit会触发ECC错误)
+            stlink.WriteReg32(FB + CR1, (1u << 1) | (2u << 4));
             cr = stlink.ReadReg32(FB + CR1);
             if ((cr & 0x02) == 0) throw new STM32Error($"H7: PG位设置失败 CR=0x{cr:X8}");
 
@@ -412,7 +429,7 @@ namespace Stm32Prog
                     bool match = true;
                     for (int i = 0; i < 32; i++) if (rb[i] != chunk[i]) { match = false; break; }
                     if (match) { ok = true; break; }
-                    stlink.WriteReg32(FB + CR1, (1u << 1) | (3u << 4));
+                    stlink.WriteReg32(FB + CR1, (1u << 1) | (2u << 4));
                 }
                 if (!ok) throw new STM32Error($"H7: word @ 0x{waddr:X8} 写入失败 (重试4次) SR=0x{sr:X8}");
                 written += len;
@@ -450,21 +467,41 @@ namespace Stm32Prog
 
         void WriteFlashF1(uint addr, byte[] data)
         {
-            int total = data.Length;
-            stlink.WriteReg32(flashBase + FLASH_CR, 0x01);
-            int written = 0, block = 4, lastPct = -1;
-            while (written < total)
+            // F0/F1: 半字(16-bit) 编程。必须用 WRITEMEM_16BIT(0x48)，
+            // 8/32-bit 总线写无法触发 F1 Flash 编程。逐半字写，每个半字写后等 BSY 清零。
+            // 长度补齐到偶数(半字对齐)，尾部补 0xFF
+            if (data.Length % 2 != 0)
             {
-                int len = Math.Min(block, total - written);
-                int padded = (len % 4 == 0) ? len : len + (4 - len % 4);
-                var chunk = new byte[padded];
-                for (int i = 0; i < padded; i++) chunk[i] = 0xFF;
-                Array.Copy(data, written, chunk, 0, len);
-                stlink.WriteMem32(addr + (uint)written, chunk);
-                FlashWait(1);
-                written += len;
-                int pct = written * 100 / total;
-                if (pct != lastPct) { Console.Write($"\r  写入: {pct}%"); lastPct = pct; }
+                var d2 = new byte[data.Length + 1];
+                Array.Copy(data, d2, data.Length);
+                d2[data.Length] = 0xFF;
+                data = d2;
+            }
+            int total = data.Length;
+            stlink.WriteReg32(flashBase + FLASH_CR, 0x01); // PG
+            int written = 0, lastPct = -1;
+            try
+            {
+                while (written < total)
+                {
+                    var half = new byte[2] { data[written], data[written + 1] };
+                    stlink.WriteMem16(addr + (uint)written, half);
+                    FlashWait(1);
+                    uint sr = stlink.ReadReg32(flashBase + FLASH_SR);
+                    if ((sr & ((1u << 2) | (1u << 4))) != 0)
+                    {
+                        stlink.WriteReg32(flashBase + FLASH_SR, sr);
+                        string err = ((sr & (1u << 2)) != 0 ? "PGERR " : "") + ((sr & (1u << 4)) != 0 ? "WRPRTERR" : "");
+                        throw new STM32Error($"F1 编程错误 @ 0x{addr + (uint)written:X8} SR=0x{sr:X8} ({err})");
+                    }
+                    written += 2;
+                    int pct = written * 100 / total;
+                    if (pct != lastPct) { Console.Write($"\r  写入: {pct}%"); lastPct = pct; }
+                }
+            }
+            finally
+            {
+                stlink.WriteReg32(flashBase + FLASH_CR, 0x00); // 清PG
             }
             Console.WriteLine();
         }

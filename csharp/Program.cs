@@ -67,6 +67,7 @@ namespace Stm32Prog
         const byte DFU_EXIT = 0x07;
         const byte DBG_ENTER = 0x30, DBG_EXIT = 0x21;
         const byte DBG_RESETSYS = 0x03, DBG_READMEM32 = 0x07, DBG_WRITEMEM32 = 0x08;
+        const byte DBG_WRITEMEM16 = 0x48;  // 16-bit 总线写内存，F1 半字编程必需
         const byte DBG_RUNCORE = 0x09, DBG_HALTCORE = 0x02, DBG_ENTER_SWD = 0xA3;
 
         UsbContext _ctx;
@@ -298,6 +299,18 @@ namespace Stm32Prog
         {
             var cmd = new byte[16];
             cmd[0] = CMD_DEBUG; cmd[1] = 0x0D;
+            BitConverter.GetBytes(addr).CopyTo(cmd, 2);
+            BitConverter.GetBytes((ushort)data.Length).CopyTo(cmd, 6);
+            WriteRaw(cmd, 1000);
+            WriteRaw(data, 1000);
+        }
+
+        // 16-bit 总线写内存 (WRITEMEM_16BIT=0x48)。STM32F0/F1 Flash 半字编程必需，
+        // 8-bit/32-bit 总线写无法触发 F1 编程。
+        public void WriteMem16(uint addr, byte[] data)
+        {
+            var cmd = new byte[16];
+            cmd[0] = CMD_DEBUG; cmd[1] = DBG_WRITEMEM16;
             BitConverter.GetBytes(addr).CopyTo(cmd, 2);
             BitConverter.GetBytes((ushort)data.Length).CopyTo(cmd, 6);
             WriteRaw(cmd, 1000);
