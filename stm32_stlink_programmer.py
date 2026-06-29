@@ -123,22 +123,65 @@ class IntelHexParser:
 class STLink:
     """ST-Link USB 通信 - 与 stlink_debug.py 完全一致的通信方式"""
 
-    def __init__(self):
+    def __init__(self, serial=None, index=None):
         self.dev = None
         self._ep_out = 0x02  # V2默认
         self._ep_in = 0x81
+        self.serial = serial    # 按序列号选择设备
+        self.index = index      # 按编号选择设备(从1开始)
+
+    @staticmethod
+    def list_devices():
+        """枚举所有已连接的 ST-Link 设备，返回 [(dev, pid, name, serial), ...]"""
+        devs = []
+        for pid in STLINK_PIDS:
+            found = usb.core.find(find_all=True, idVendor=STLINK_VID,
+                                  idProduct=pid, backend=_usb_backend)
+            for d in (found or []):
+                name = {STLINK_V2_PID: "V2", STLINK_V21_PID: "V2-1",
+                        STLINK_V3_PID: "V3"}.get(pid, "?")
+                try:
+                    sn = usb.util.get_string(d, d.iSerialNumber) or ""
+                except Exception:
+                    sn = ""
+                devs.append((d, pid, name, sn))
+        return devs
 
     def open(self):
-        for pid in STLINK_PIDS:
-            self.dev = usb.core.find(idVendor=STLINK_VID, idProduct=pid, backend=_usb_backend)
-            if self.dev:
-                break
-        if self.dev is None:
+        devs = STLink.list_devices()
+        if not devs:
             raise STM32Error("未找到 ST-Link 设备")
 
-        pid = self.dev.idProduct
-        name = {STLINK_V2_PID: "V2", STLINK_V21_PID: "V2-1", STLINK_V3_PID: "V3"}.get(pid, "?")
-        print(f"[✓] 找到 ST-Link {name} (PID: 0x{pid:04X})")
+        chosen = None
+        if self.serial:
+            # 按序列号匹配（支持部分匹配）
+            for d, pid, name, sn in devs:
+                if sn and (sn == self.serial or self.serial in sn):
+                    chosen = (d, pid, name, sn); break
+            if chosen is None:
+                raise STM32Error(f"未找到序列号匹配 '{self.serial}' 的 ST-Link 设备")
+        elif self.index is not None:
+            if self.index < 1 or self.index > len(devs):
+                raise STM32Error(f"设备编号 {self.index} 超出范围 (共 {len(devs)} 个)")
+            chosen = devs[self.index - 1]
+        elif len(devs) == 1:
+            chosen = devs[0]
+        else:
+            # 多个设备且未指定 → 交互式选择
+            print(f"[*] 检测到 {len(devs)} 个 ST-Link 设备:")
+            for i, (d, pid, name, sn) in enumerate(devs, 1):
+                print(f"    {i}. ST-Link {name} (PID: 0x{pid:04X}) 序列号: {sn or '(无)'}")
+            while True:
+                try:
+                    sel = input(f"  请选择要使用的设备 [1-{len(devs)}]: ").strip()
+                except EOFError:
+                    raise STM32Error("检测到多个 ST-Link，请用 --device N 或 --serial SN 指定")
+                if sel.isdigit() and 1 <= int(sel) <= len(devs):
+                    chosen = devs[int(sel) - 1]; break
+                print("  输入无效，请重新输入")
+
+        self.dev, pid, name, sn = chosen
+        print(f"[✓] 使用 ST-Link {name} (PID: 0x{pid:04X})" + (f" 序列号: {sn}" if sn else ""))
 
         if pid != STLINK_V2_PID:
             self._ep_out = 0x01
@@ -397,8 +440,8 @@ class STM32Programmer:
     AIRCR = 0xE000ED0C
     DBGMCU_IDCODE = 0xE0042000
 
-    def __init__(self):
-        self.stlink = STLink()
+    def __init__(self, serial=None, index=None):
+        self.stlink = STLink(serial=serial, index=index)
         self.chip_id = None
         self.flash_base = self.FLASH_BASE_F1
         self.is_f4 = False
@@ -989,13 +1032,27 @@ def main():
     parser.add_argument('--no-verify', action='store_true', help='跳过校验')
     parser.add_argument('--no-run', action='store_true', help='不启动')
     parser.add_argument('--chip', help='手动指定芯片系列: h7/f7/f4/f1/f0 (ID读取失败时用)')
+    parser.add_argument('-d', '--device', type=int, help='多个ST-Link时按编号选择(从1开始)')
+    parser.add_argument('--serial', help='多个ST-Link时按序列号选择(支持部分匹配)')
+    parser.add_argument('-l', '--list', action='store_true', help='列出所有ST-Link设备')
     args = parser.parse_args()
+
+    # 列出设备
+    if args.list:
+        devs = STLink.list_devices()
+        if not devs:
+            print("未找到 ST-Link 设备")
+        else:
+            print(f"检测到 {len(devs)} 个 ST-Link 设备:")
+            for i, (d, pid, name, sn) in enumerate(devs, 1):
+                print(f"  {i}. ST-Link {name} (PID: 0x{pid:04X}) 序列号: {sn or '(无)'}")
+        return
 
     if not any([args.firmware, args.info, args.erase, args.read]):
         parser.print_help()
         return
 
-    prog = STM32Programmer()
+    prog = STM32Programmer(serial=args.serial, index=args.device)
     try:
         if args.firmware:
             if not os.path.isfile(args.firmware):

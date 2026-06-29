@@ -76,22 +76,80 @@ namespace Stm32Prog
         UsbEndpointReader _reader;
         byte _epOut = 0x02, _epIn = 0x81;
 
+        public string Serial = null;   // 按序列号选择
+        public int? Index = null;      // 按编号选择(从1开始)
+
+        static string PidName(int pid) =>
+            pid == V2_PID ? "V2" : pid == V21_PID ? "V2-1" : pid == V3_PID ? "V3" : "?";
+
+        // 枚举所有 ST-Link 设备，返回 (device, pid, name, serial) 列表
+        public static List<(IUsbDevice dev, int pid, string name, string serial)> ListDevices(UsbContext ctx)
+        {
+            var result = new List<(IUsbDevice, int, string, string)>();
+            var all = ctx.List();
+            foreach (var pid in PIDS)
+            {
+                foreach (var d in all.Where(x => x.VendorId == STLINK_VID && x.ProductId == pid))
+                {
+                    string sn = "";
+                    try { d.Open(); sn = d.Info?.SerialNumber ?? ""; }
+                    catch { }
+                    result.Add((d, pid, PidName(pid), sn));
+                }
+            }
+            return result;
+        }
+
         public void Open()
         {
             _ctx = new UsbContext();
-            var all = _ctx.List();
-            foreach (var pid in PIDS)
-            {
-                _dev = all.FirstOrDefault(d => d.VendorId == STLINK_VID && d.ProductId == pid);
-                if (_dev != null) break;
-            }
-            if (_dev == null)
+            var devs = ListDevices(_ctx);
+            if (devs.Count == 0)
                 throw new STM32Error("未找到 ST-Link 设备");
 
+            (IUsbDevice dev, int pid, string name, string serial) chosen;
+            if (!string.IsNullOrEmpty(Serial))
+            {
+                var m = devs.FirstOrDefault(x => !string.IsNullOrEmpty(x.serial) &&
+                                                 (x.serial == Serial || x.serial.Contains(Serial)));
+                if (m.dev == null)
+                    throw new STM32Error($"未找到序列号匹配 '{Serial}' 的 ST-Link 设备");
+                chosen = m;
+            }
+            else if (Index.HasValue)
+            {
+                if (Index.Value < 1 || Index.Value > devs.Count)
+                    throw new STM32Error($"设备编号 {Index.Value} 超出范围 (共 {devs.Count} 个)");
+                chosen = devs[Index.Value - 1];
+            }
+            else if (devs.Count == 1)
+            {
+                chosen = devs[0];
+            }
+            else
+            {
+                Console.WriteLine($"[*] 检测到 {devs.Count} 个 ST-Link 设备:");
+                for (int i = 0; i < devs.Count; i++)
+                    Console.WriteLine($"    {i + 1}. ST-Link {devs[i].name} (PID: 0x{devs[i].pid:X4}) 序列号: {(string.IsNullOrEmpty(devs[i].serial) ? "(无)" : devs[i].serial)}");
+                int sel = -1;
+                while (true)
+                {
+                    Console.Write($"  请选择要使用的设备 [1-{devs.Count}]: ");
+                    string line = Console.ReadLine();
+                    if (line == null)
+                        throw new STM32Error("检测到多个 ST-Link，请用 -d N 或 --serial SN 指定");
+                    if (int.TryParse(line.Trim(), out sel) && sel >= 1 && sel <= devs.Count) break;
+                    Console.WriteLine("  输入无效，请重新输入");
+                }
+                chosen = devs[sel - 1];
+            }
+
+            _dev = chosen.dev;
             _dev.Open();
             int pidNow = _dev.ProductId;
-            string name = pidNow == V2_PID ? "V2" : pidNow == V21_PID ? "V2-1" : pidNow == V3_PID ? "V3" : "?";
-            Console.WriteLine($"[OK] 找到 ST-Link {name} (PID: 0x{pidNow:X4})");
+            string nm = PidName(pidNow);
+            Console.WriteLine($"[OK] 使用 ST-Link {nm} (PID: 0x{pidNow:X4})" +
+                              (string.IsNullOrEmpty(chosen.serial) ? "" : $" 序列号: {chosen.serial}"));
             if (pidNow != V2_PID) _epOut = 0x01;
 
             // 不调用 SetConfiguration（Windows WinUSB 下会重置端点状态导致超时）

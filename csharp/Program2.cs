@@ -1,7 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading;
+using LibUsbDotNet;
+using LibUsbDotNet.LibUsb;
+using LibUsbDotNet.Main;
 
 namespace Stm32Prog
 {
@@ -39,6 +43,11 @@ namespace Stm32Prog
         };
 
         STLink stlink = new STLink();
+        public STM32Programmer(string serial = null, int? index = null)
+        {
+            stlink.Serial = serial;
+            stlink.Index = index;
+        }
         int chipId = 0;
         uint flashBase = FLASH_BASE_F1;
         bool isF4 = false, isH7 = false, isF7 = false;
@@ -632,6 +641,9 @@ namespace Stm32Prog
             int size = 256;
             bool noVerify = false, noRun = false, info = false, erase = false, read = false;
             string chip = null;
+            string serial = null;
+            int? device = null;
+            bool listDev = false;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -647,8 +659,28 @@ namespace Stm32Prog
                     case "-i": case "--info": info = true; break;
                     case "-e": case "--erase": erase = true; break;
                     case "-r": case "--read": read = true; break;
+                    case "-d": case "--device": device = (int)ParseUInt(args[++i]); break;
+                    case "--serial": serial = args[++i]; break;
+                    case "-l": case "--list": listDev = true; break;
                     case "-h": case "--help": PrintHelp(); return 0;
                 }
+            }
+
+            // 列出所有 ST-Link 设备
+            if (listDev)
+            {
+                using (var ctx = new UsbContext())
+                {
+                    var ds = STLink.ListDevices(ctx);
+                    if (ds.Count == 0) Console.WriteLine("未找到 ST-Link 设备");
+                    else
+                    {
+                        Console.WriteLine($"检测到 {ds.Count} 个 ST-Link 设备:");
+                        for (int k = 0; k < ds.Count; k++)
+                            Console.WriteLine($"  {k + 1}. ST-Link {ds[k].name} (PID: 0x{ds[k].pid:X4}) 序列号: {(string.IsNullOrEmpty(ds[k].serial) ? "(无)" : ds[k].serial)}");
+                    }
+                }
+                return 0;
             }
 
             // 无参数：自动烧录 exe 同目录下的 firmware.hex
@@ -664,7 +696,7 @@ namespace Stm32Prog
                     Console.WriteLine($"[*] 自动模式: 烧录同目录固件 {Path.GetFileName(firmware)}");
             }
 
-            var prog = new STM32Programmer();
+            var prog = new STM32Programmer(serial, device);
             int rc = 0;
             try
             {
@@ -731,6 +763,9 @@ namespace Stm32Prog
             Console.WriteLine("  -i, --info            读取芯片信息");
             Console.WriteLine("  -e, --erase           全片擦除");
             Console.WriteLine("  -r, --read            读取Flash (-a 地址 -s 大小 [-o 文件])");
+            Console.WriteLine("  -l, --list            列出所有 ST-Link 设备");
+            Console.WriteLine("  -d, --device <编号>   多个ST-Link时按编号选择(从1开始)");
+            Console.WriteLine("  --serial <序列号>     多个ST-Link时按序列号选择(支持部分匹配)");
             Console.WriteLine("  -h, --help            显示帮助");
             Console.WriteLine("\n示例: stm32_stlink -f firmware.hex");
         }
