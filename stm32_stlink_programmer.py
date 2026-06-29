@@ -71,7 +71,9 @@ CHIP_IDS = {
     0x421: "STM32F446", 0x423: "STM32F401xB/C",
     0x425: "STM32L0xx", 0x428: "STM32F1 VL High",
     0x430: "STM32F1 XL", 0x431: "STM32F411",
-    0x432: "STM32F37x", 0x433: "STM32F401xD/E",
+    0x422: "STM32F302xB/C/F303xB/C", 0x432: "STM32F37x",
+    0x433: "STM32F401xD/E", 0x438: "STM32F303x4/F334/F328",
+    0x439: "STM32F301/F302x6x8/F318", 0x446: "STM32F302xE/F303xE",
     0x434: "STM32F469/479", 0x440: "STM32F05x",
     0x441: "STM32F412", 0x442: "STM32F09x",
     0x444: "STM32F03x", 0x445: "STM32F04x",
@@ -939,6 +941,8 @@ class STM32Programmer:
         return bytes(result[:size])
 
     def reset_run(self):
+        """复位并运行。注意：部分 bootloader 只在上电复位(POR)时才跳 APP，
+        软件复位会留在 boot；若复位后仍停在 boot，请断电重启。"""
         self.stlink.write_reg32(self.AIRCR, 0x05FA0004)
         time.sleep(0.1)
         self.stlink.run()
