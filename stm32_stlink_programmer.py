@@ -166,14 +166,16 @@ class STLink:
         buf = bytes(buf)
         # buf[0]=bLength, buf[1]=bDescriptorType(0x03)，其后为字符串数据
         data = buf[2:buf[0]] if len(buf) >= 2 and buf[0] >= 2 else buf
-        # 合法 UTF-16LE 文本：长度偶数、奇数位(高字节)全 0、偶数位为可打印 ASCII
-        is_utf16_text = (len(data) >= 2 and len(data) % 2 == 0 and
-                         all(data[i] == 0 for i in range(1, len(data), 2)) and
-                         all(32 <= data[i] < 127 for i in range(0, len(data), 2)))
-        if is_utf16_text:
-            return ''.join(chr(data[i]) for i in range(0, len(data), 2))
-        # ST-Link V2 老款：原始二进制 ID → 大写 hex
-        return ''.join(f"{b:02X}" for b in data)
+        # ST-Link 的字符串描述符把序列号当 UTF-16 存：奇数位(高字节)全为 0，
+        # 真实序列号字节在偶数位(低字节)。先剥离高字节 0 取出真实字节序列。
+        if len(data) >= 2 and len(data) % 2 == 0 and all(data[i] == 0 for i in range(1, len(data), 2)):
+            real = bytes(data[i] for i in range(0, len(data), 2))
+        else:
+            real = bytes(data)
+        # 真实字节若全为可打印 ASCII → 文本序列号；否则转大写 hex(与 CubeProgrammer 一致)
+        if real and all(32 <= b < 127 for b in real):
+            return real.decode('ascii')
+        return ''.join(f"{b:02X}" for b in real)
 
     def open(self):
         devs = STLink.list_devices()

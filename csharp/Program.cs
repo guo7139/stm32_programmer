@@ -122,21 +122,24 @@ namespace Stm32Prog
                 if (dlen < 2 || dlen > len) dlen = len;
                 var data = new byte[dlen - 2];
                 Array.Copy(buf, 2, data, 0, dlen - 2);
-                // 合法 UTF-16LE 文本：长度偶数、奇数位(高字节)全0、偶数位可打印ASCII
-                bool isText = data.Length >= 2 && data.Length % 2 == 0;
-                if (isText)
-                    for (int i = 0; i < data.Length; i++)
-                    {
-                        if (i % 2 == 1 && data[i] != 0) { isText = false; break; }
-                        if (i % 2 == 0 && !(data[i] >= 32 && data[i] < 127)) { isText = false; break; }
-                    }
-                if (isText)
+                // ST-Link 字符串描述符把序列号当 UTF-16 存：奇数位(高字节)全0，
+                // 真实序列号字节在偶数位(低字节)。先剥离高字节0取出真实字节。
+                byte[] real;
+                bool utf16 = data.Length >= 2 && data.Length % 2 == 0;
+                if (utf16)
+                    for (int i = 1; i < data.Length; i += 2)
+                        if (data[i] != 0) { utf16 = false; break; }
+                if (utf16)
                 {
-                    var sb = new System.Text.StringBuilder();
-                    for (int i = 0; i < data.Length; i += 2) sb.Append((char)data[i]);
-                    return sb.ToString();
+                    real = new byte[data.Length / 2];
+                    for (int i = 0; i < real.Length; i++) real[i] = data[i * 2];
                 }
-                return string.Concat(data.Select(b => b.ToString("X2")));
+                else real = data;
+                // 真实字节全可打印ASCII→文本；否则转大写hex(与CubeProgrammer一致)
+                bool isText = real.Length > 0 && real.All(b => b >= 32 && b < 127);
+                if (isText)
+                    return new string(real.Select(b => (char)b).ToArray());
+                return string.Concat(real.Select(b => b.ToString("X2")));
             }
             catch { return FallbackSerial(d); }
         }
