@@ -92,12 +92,62 @@ namespace Stm32Prog
                 foreach (var d in all.Where(x => x.VendorId == STLINK_VID && x.ProductId == pid))
                 {
                     string sn = "";
-                    try { d.Open(); sn = d.Info?.SerialNumber ?? ""; }
+                    try { d.Open(); sn = ReadSerial(d); }
                     catch { }
                     result.Add((d, pid, PidName(pid), sn));
                 }
             }
             return result;
+        }
+
+        // 读取 ST-Link 序列号。老款 ST-Link V2 序列号是原始二进制 12 字节，
+        // 按文本解码会乱码，需转十六进制（与 STM32CubeProgrammer 一致）。
+        static string ReadSerial(IUsbDevice d)
+        {
+            try
+            {
+                // 1. 读设备描述符(type=0x01)取 iSerialNumber(偏移16)
+                var devDesc = new byte[18];
+                var sp1 = new UsbSetupPacket(0x80, 0x06, (short)(0x01 << 8), 0, (short)devDesc.Length);
+                int n1 = d.ControlTransfer(sp1, devDesc, 0, devDesc.Length);
+                if (n1 < 17) return FallbackSerial(d);
+                byte idx = devDesc[16];
+                if (idx == 0) return FallbackSerial(d);
+                // 2. 读字符串描述符(type=0x03, langid=0x0409)
+                var buf = new byte[255];
+                var sp2 = new UsbSetupPacket(0x80, 0x06, (short)((0x03 << 8) | idx), 0x0409, (short)buf.Length);
+                int len = d.ControlTransfer(sp2, buf, 0, buf.Length);
+                if (len < 2) return FallbackSerial(d);
+                int dlen = buf[0];
+                if (dlen < 2 || dlen > len) dlen = len;
+                var data = new byte[dlen - 2];
+                Array.Copy(buf, 2, data, 0, dlen - 2);
+                // 合法 UTF-16LE 文本：长度偶数、奇数位(高字节)全0、偶数位可打印ASCII
+                bool isText = data.Length >= 2 && data.Length % 2 == 0;
+                if (isText)
+                    for (int i = 0; i < data.Length; i++)
+                    {
+                        if (i % 2 == 1 && data[i] != 0) { isText = false; break; }
+                        if (i % 2 == 0 && !(data[i] >= 32 && data[i] < 127)) { isText = false; break; }
+                    }
+                if (isText)
+                {
+                    var sb = new System.Text.StringBuilder();
+                    for (int i = 0; i < data.Length; i += 2) sb.Append((char)data[i]);
+                    return sb.ToString();
+                }
+                return string.Concat(data.Select(b => b.ToString("X2")));
+            }
+            catch { return FallbackSerial(d); }
+        }
+
+        // 退路：直接用已解码的 SerialNumber，可打印则保留，否则按字符低字节转 hex
+        static string FallbackSerial(IUsbDevice d)
+        {
+            string sn = d.Info?.SerialNumber ?? "";
+            if (sn.Length == 0) return "";
+            if (sn.All(c => c >= 32 && c < 127)) return sn;
+            return string.Concat(sn.Select(c => ((int)c & 0xFF).ToString("X2")));
         }
 
         public void Open()
