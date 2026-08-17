@@ -262,7 +262,7 @@ class AuthClient:
             if display < 1024 or unit == units[-1]:
                 break
             display /= 1024
-        return f'{int(display)} {unit}' if unit == 'B' else f'{display:.2f} {unit}'
+        return f'{int(display)} {unit}' if unit == 'B' else f'{display:.1f} {unit}'
 
     @staticmethod
     def parse_burn_address(value):
