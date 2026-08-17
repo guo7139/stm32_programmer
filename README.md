@@ -278,3 +278,44 @@ PSIZE 同 F7 固定 32-bit。擦除用两步法（先配 SER+SNB+PSIZE 再单独
 
 - ST-Link USB 协议（参考 stlink-org/stlink、OpenOCD 源码）
 - STM32H743 参考手册 RM0433（Embedded Flash memory 章节）
+
+## 用户登录与权限验证
+
+使用烧录、读取、擦除或解除保护功能前，必须先登录：
+
+```bash
+python stm32_uart_programmer.py --login --username admin
+```
+
+程序随后以隐藏方式读取密码，并向以下接口发送 JSON 请求：
+
+```text
+POST http://192.168.60.241:9100/api/login
+Content-Type: application/json
+
+{"username": "admin", "password": "..."}
+```
+
+登录成功后仅保存服务器返回的 `api_token`，不保存用户名和密码。令牌文件位置：
+
+- Windows：`%APPDATA%\stm32_programmer\auth.json`
+- Linux：`~/.config/stm32_programmer/auth.json`
+
+登录后可正常执行烧录：
+
+```bash
+python stm32_uart_programmer.py -p COM4 -f firmware.bin --wait-port -a 0x08008000
+```
+
+退出登录并删除本机令牌：
+
+```bash
+python stm32_uart_programmer.py --logout
+```
+
+代码中的 `AuthClient.request()` 会为后续 HTTP API 自动携带：
+
+```text
+Authorization: Bearer <api_token>
+api_token: <api_token>
+```

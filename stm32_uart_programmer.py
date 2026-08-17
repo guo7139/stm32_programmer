@@ -12,9 +12,14 @@ import serial
 import struct
 import time
 import argparse
+import getpass
+import json
 import sys
 import os
+import tempfile
 from pathlib import Path
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 
 # ============ 协议常量 ============
@@ -41,6 +46,105 @@ DEFAULT_FLASH_START = 0x08000000
 
 # 每次写入的最大字节数
 WRITE_BLOCK_SIZE = 256
+
+# 用户认证服务器
+AUTH_SERVER = "http://192.168.60.241:9100"
+AUTH_LOGIN_PATH = "/api/login"
+AUTH_TIMEOUT = 10
+
+
+class AuthenticationError(Exception):
+    """用户认证错误"""
+    pass
+
+
+class AuthClient:
+    """登录、保存令牌以及自动携带令牌的 HTTP API 客户端。"""
+
+    def __init__(self, server=AUTH_SERVER, timeout=AUTH_TIMEOUT):
+        self.server = server.rstrip('/')
+        self.timeout = timeout
+        self.token_file = self._get_token_file()
+        self.api_token = self._load_token()
+
+    @staticmethod
+    def _get_token_file():
+        if os.name == 'nt':
+            base = Path(os.environ.get('APPDATA', Path.home() / 'AppData' / 'Roaming'))
+        else:
+            base = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config'))
+        return base / 'stm32_programmer' / 'auth.json'
+
+    def _load_token(self):
+        try:
+            data = json.loads(self.token_file.read_text(encoding='utf-8'))
+            token = data.get('api_token')
+            return token if isinstance(token, str) and token else None
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def _save_token(self, token):
+        self.token_file.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(prefix='auth-', suffix='.tmp', dir=str(self.token_file.parent))
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump({'api_token': token}, f)
+            try:
+                os.chmod(temp_name, 0o600)
+            except OSError:
+                pass
+            os.replace(temp_name, self.token_file)
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
+
+    def logout(self):
+        self.api_token = None
+        try:
+            self.token_file.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _send(self, path, method='GET', payload=None, require_token=True):
+        headers = {'Accept': 'application/json'}
+        body = None
+        if payload is not None:
+            body = json.dumps(payload).encode('utf-8')
+            headers['Content-Type'] = 'application/json'
+        if require_token:
+            if not self.api_token:
+                raise AuthenticationError('尚未登录，请先使用 --login 登录')
+            # 同时提供标准Bearer头和api_token头，兼容服务端常见校验方式。
+            headers['Authorization'] = f'Bearer {self.api_token}'
+            headers['api_token'] = self.api_token
+        req = urllib_request.Request(self.server + path, data=body, headers=headers, method=method)
+        try:
+            with urllib_request.urlopen(req, timeout=self.timeout) as response:
+                raw = response.read().decode('utf-8')
+        except urllib_error.HTTPError as e:
+            detail = e.read().decode('utf-8', errors='replace')
+            raise AuthenticationError(f'服务器返回 HTTP {e.code}: {detail or e.reason}') from e
+        except urllib_error.URLError as e:
+            raise AuthenticationError(f'无法连接登录服务器 {self.server}: {e.reason}') from e
+        try:
+            return json.loads(raw) if raw else {}
+        except json.JSONDecodeError as e:
+            raise AuthenticationError('服务器返回的不是有效 JSON') from e
+
+    def login(self, username, password):
+        result = self._send(AUTH_LOGIN_PATH, method='POST',
+                            payload={'username': username, 'password': password},
+                            require_token=False)
+        token = result.get('api_token')
+        if result.get('ok') is not True or not isinstance(token, str) or not token:
+            raise AuthenticationError(result.get('message') or result.get('error') or '用户名或密码错误')
+        self.api_token = token
+        self._save_token(token)
+        return result
+
+    def request(self, path, method='GET', payload=None):
+        """供其他业务接口调用：自动附带已保存的api_token。"""
+        return self._send(path, method=method, payload=payload, require_token=True)
 
 
 class STM32Error(Exception):
@@ -693,6 +797,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用示例:
+  # 首次登录（密码会隐藏输入）
+  python stm32_uart_programmer.py --login --username admin
+
   # 烧录 bin 文件（默认地址 0x08000000）
   python stm32_uart_programmer.py -p /dev/ttyUSB0 -f firmware.bin
 
@@ -725,8 +832,14 @@ def main():
     如极性不对可加 --invert-reset / --invert-boot0
 """)
 
-    parser.add_argument('-p', '--port', required=True,
-                        help='串口设备 (如 /dev/ttyUSB0 或 COM3)')
+    parser.add_argument('-p', '--port',
+                        help='串口设备 (如 /dev/ttyUSB0 或 COM3；烧录操作必填)')
+    parser.add_argument('--login', action='store_true',
+                        help='登录服务器并保存api_token')
+    parser.add_argument('--username',
+                        help='登录用户名（与--login一起使用）')
+    parser.add_argument('--logout', action='store_true',
+                        help='删除本机保存的api_token并退出登录')
     parser.add_argument('--wait-port', action='store_true',
                         help='启动时等待串口设备出现（用于断电重连场景）')
     parser.add_argument('--auto-reset', action='store_true',
@@ -763,8 +876,34 @@ def main():
                         help='解除读保护（会擦除全片！）')
 
     args = parser.parse_args()
+    auth = AuthClient()
 
-    # 参数校验
+    if args.logout:
+        auth.logout()
+        print("[✓] 已退出登录，本机api_token已删除")
+        return
+
+    if args.login:
+        username = args.username or input("用户名: ").strip()
+        if not username:
+            parser.error("用户名不能为空")
+        password = getpass.getpass("密码: ")
+        if not password:
+            parser.error("密码不能为空")
+        try:
+            user = auth.login(username, password)
+        except AuthenticationError as e:
+            print(f"[✗] 登录失败: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"[✓] 登录成功: {user.get('name') or user.get('username') or username}")
+        return
+
+    # 除登录、退出和帮助外，所有软件功能均要求已登录。
+    if not auth.api_token:
+        parser.error("请先登录：python stm32_uart_programmer.py --login --username <用户名>")
+
+    if not args.port:
+        parser.error("烧录操作需要指定串口 (-p/--port)")
     if not args.erase_only and not args.read and not args.firmware \
             and not args.unprotect_write and not args.unprotect_read:
         parser.error("请指定固件文件 (-f) 或操作模式 (--erase-only/--read/--unprotect-*)")

@@ -17,3 +17,6 @@ f1_test48.py
 h7_diag.py
 h7_fix_test.py
 cur_diag.py
+
+# 本地登录令牌（正常保存于系统用户配置目录，防止误提交）
+auth.json
