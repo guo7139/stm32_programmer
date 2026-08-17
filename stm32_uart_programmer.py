@@ -120,7 +120,17 @@ class IntelHexParser:
 class STM32Programmer:
     """STM32 UART Bootloader 烧录器"""
 
-    def __init__(self, port, baudrate=115200, timeout=5.0):
+    # DTR/RTS 接线约定（可通过参数反转）：
+    #   DTR -> RESET (低电平有效)
+    #   RTS -> BOOT0 (高电平进Bootloader)
+    # 注意：pyserial 中 setDTR(True) 实际输出低电平（RS232反相逻辑）
+    # 所以 dtr=True -> 引脚低电平 -> 复位有效
+    #      rts=True -> 引脚低电平 -> BOOT0=0（正常启动）
+    # 实际极性取决于具体电路（是否有反相器），通过 invert_dtr/invert_rts 调整
+
+    def __init__(self, port, baudrate=115200, timeout=5.0,
+                 reset_pin='dtr', boot0_pin='rts',
+                 invert_reset=False, invert_boot0=False):
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout
@@ -128,37 +138,233 @@ class STM32Programmer:
         self.supported_cmds = []
         self.bootloader_version = None
         self.chip_id = None
+        # DTR/RTS 引脚映射
+        self.reset_pin = reset_pin    # 'dtr' or 'rts'
+        self.boot0_pin = boot0_pin    # 'rts' or 'dtr'
+        self.invert_reset = invert_reset
+        self.invert_boot0 = invert_boot0
 
-    def connect(self):
-        """打开串口并同步握手"""
-        print(f"[*] 打开串口 {self.port} @ {self.baudrate} baud...")
+    def _set_pin(self, pin, active):
+        """设置DTR/RTS引脚状态
+        
+        Args:
+            pin: 'dtr' or 'rts'
+            active: True=有效（复位/BOOT0高）
+        """
+        if pin == 'dtr':
+            # pyserial: dtr=True -> 引脚电压低（RS232逻辑）
+            # 多数电路: DTR低 -> RESET有效，所以 active=True -> setDTR(True)
+            self.serial.dtr = active
+        else:
+            self.serial.rts = active
+
+    def reset_to_bootloader(self):
+        """通过DTR/RTS信号线复位芯片并进入Bootloader模式
+        
+        时序:
+          1. BOOT0 = 1（拉高，准备进入Bootloader）
+          2. RESET = 0（复位有效）
+          3. 延时 100ms
+          4. RESET = 1（释放复位）
+          5. 延时 50ms（等待Bootloader启动）
+        """
+        print("[*] 通过 DTR/RTS 自动复位芯片进入 Bootloader...")
+        # 如果串口未打开，先打开
+        if self.serial is None or not self.serial.is_open:
+            self.serial = serial.Serial(
+                port=self.port,
+                baudrate=self.baudrate,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_EVEN,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=self.timeout
+            )
+
+        
+        reset_active = not self.invert_reset   # 复位有效电平
+        reset_inactive = self.invert_reset
+        boot0_high = not self.invert_boot0     # BOOT0=1
+        boot0_low = self.invert_boot0
+
+        # Step 1: BOOT0 拉高
+        self._set_pin(self.boot0_pin, boot0_high)
+        time.sleep(0.01)
+        
+        # Step 2: 产生复位脉冲（拉低RESET）
+        self._set_pin(self.reset_pin, reset_active)
+        time.sleep(0.1)
+        
+        # Step 3: 释放复位
+        self._set_pin(self.reset_pin, reset_inactive)
+        time.sleep(0.05)
+        
+        # 复位后串口可能不稳定（USB串口适配器可能重新枚举）
+        # 先尝试直接同步，失败则关闭串口等待重连后再次复位
+        try:
+            self.serial.reset_input_buffer()
+            time.sleep(0.1)
+            print("[*] 发送同步字节 0x7F...")
+            self._sync()
+            print("[✓] 同步成功，已连接到 Bootloader")
+            return
+        except (serial.SerialException, PermissionError, OSError, STM32Error):
+            pass
+
+        # 直接同步失败，关闭串口等待重连
+        try:
+            self.serial.close()
+        except Exception:
+            pass
+        self.serial = None
+        print("[*] 串口不稳定，等待重新就绪...")
+        time.sleep(2.0)
+        self._wait_for_port(timeout=30)
+
+        # 重新打开串口
         self.serial = serial.Serial(
             port=self.port,
             baudrate=self.baudrate,
             bytesize=serial.EIGHTBITS,
-            parity=serial.PARITY_EVEN,  # AN3155 要求偶校验
+            parity=serial.PARITY_EVEN,
             stopbits=serial.STOPBITS_ONE,
             timeout=self.timeout
         )
-        self.serial.reset_input_buffer()
-        self.serial.reset_output_buffer()
+        time.sleep(0.2)
 
-        # 发送同步字节
+        # 重新拉高BOOT0并复位（因为关闭串口后引脚状态丢失）
+        print("[*] 重新复位芯片进入 Bootloader...")
+        self._set_pin(self.boot0_pin, not self.invert_boot0)  # BOOT0=1
+        time.sleep(0.01)
+        self._set_pin(self.reset_pin, not self.invert_reset)  # RESET有效
+        time.sleep(0.1)
+        self._set_pin(self.reset_pin, self.invert_reset)      # 释放RESET
+        time.sleep(0.05)
+
+        self.serial.reset_input_buffer()
+        time.sleep(0.1)
         print("[*] 发送同步字节 0x7F...")
         self._sync()
         print("[✓] 同步成功，已连接到 Bootloader")
 
+    def reset_to_app(self):
+        """复位芯片并正常启动（BOOT0=0）"""
+        print("[*] 复位芯片，正常启动用户程序...")
+        boot0_low = self.invert_boot0
+        reset_active = not self.invert_reset
+        reset_inactive = self.invert_reset
+
+        self._set_pin(self.boot0_pin, boot0_low)
+        time.sleep(0.01)
+        self._set_pin(self.reset_pin, reset_active)
+        time.sleep(0.1)
+        self._set_pin(self.reset_pin, reset_inactive)
+        print("[✓] 芯片已复位，正常运行")
+
+    def connect(self, wait_for_port=False, wait_timeout=30):
+        """打开串口并同步握手
+        
+        Args:
+            wait_for_port: 如果为True，当串口不存在时等待其出现（用于断电重连场景）
+            wait_timeout: 等待串口出现的超时时间（秒）
+        """
+        if wait_for_port:
+            self._wait_for_port(wait_timeout)
+        
+        # 带重试的串口打开+同步（应对串口刚恢复但驱动未完全就绪的情况）
+        max_retries = 5
+        for retry in range(max_retries):
+            try:
+                print(f"[*] 打开串口 {self.port} @ {self.baudrate} baud...")
+                self.serial = serial.Serial(
+                    port=self.port,
+                    baudrate=self.baudrate,
+                    bytesize=serial.EIGHTBITS,
+                    parity=serial.PARITY_EVEN,  # AN3155 要求偶校验
+                    stopbits=serial.STOPBITS_ONE,
+                    timeout=self.timeout
+                )
+                self.serial.reset_input_buffer()
+                self.serial.reset_output_buffer()
+                time.sleep(0.2)  # 等待串口稳定
+
+
+                # 发送同步字节
+                print("[*] 发送同步字节 0x7F...")
+                self._sync()
+                print("[✓] 同步成功，已连接到 Bootloader")
+                return
+            except (serial.SerialException, PermissionError, OSError) as e:
+                if self.serial and self.serial.is_open:
+                    try:
+                        self.serial.close()
+                    except Exception:
+                        pass
+                    self.serial = None
+                if retry < max_retries - 1:
+                    print(f"[!] 串口操作失败: {e}")
+                    print(f"[*] 等待 2 秒后重试 ({retry+2}/{max_retries})...")
+                    time.sleep(2.0)
+                else:
+                    raise serial.SerialException(f"串口连接失败（已重试{max_retries}次）: {e}")
+
+    def _wait_for_port(self, timeout=30):
+        """等待串口设备出现并可用（断电重连场景）"""
+        start = time.time()
+        # Windows: 检查端口是否能被打开（设备文件存在不代表驱动就绪）
+        # Linux: 检查设备文件是否存在
+        is_windows = sys.platform.startswith('win') or (os.name == 'nt')
+        
+        def port_ready():
+            """检测串口是否真正可用（不只是设备文件存在）"""
+            if is_windows:
+                try:
+                    s = serial.Serial(self.port, baudrate=self.baudrate, timeout=0.1)
+                    s.close()
+                    return True
+                except (serial.SerialException, PermissionError, OSError):
+                    return False
+            else:
+                return os.path.exists(self.port)
+        
+        if port_ready():
+            return
+        print(f"[*] 等待串口 {self.port} 就绪（请给芯片上电）...")
+        while time.time() - start < timeout:
+            if port_ready():
+                time.sleep(0.5)  # 额外等待驱动完全初始化
+                print(f"[✓] 串口 {self.port} 已就绪")
+                return
+            time.sleep(0.3)
+        raise STM32Error(f"等待串口 {self.port} 超时（{timeout}秒）")
+
+    def reconnect(self, wait_timeout=30):
+        """断电重连后重新建立连接
+        
+        用于芯片需要断电复位进入Bootloader的场景。
+        关闭当前串口，等待设备重新出现，再重新握手。
+        """
+        if self.serial and self.serial.is_open:
+            self.serial.close()
+        print("[*] 请断电重连芯片（BOOT0保持拉高），等待重新连接...")
+        self._wait_for_port(wait_timeout)
+        self.connect()
+
     def _sync(self):
         """发送同步字节并等待 ACK"""
-        for attempt in range(3):
+        # 先清空接收缓冲区（可能有上次残留数据）
+        self.serial.reset_input_buffer()
+        time.sleep(0.1)
+
+        for attempt in range(10):
             self.serial.write(bytes([SYNC_BYTE]))
             resp = self._read_byte()
             if resp == ACK:
                 return
             elif resp == NACK:
-                # 可能已经同步过了，再试
+                # NACK也算有响应，再发一次通常就ACK了
                 continue
-            time.sleep(0.1)
+            # 无响应，等待后重试（给芯片Bootloader启动时间）
+            time.sleep(0.3)
         raise STM32Error("同步失败：未收到 ACK。请确认：\n"
                          "  1. BOOT0 引脚已拉高\n"
                          "  2. 芯片已复位\n"
@@ -418,7 +624,7 @@ class STM32Programmer:
             self.serial.close()
             print("[*] 串口已关闭")
 
-    def flash_firmware(self, filepath, address=None, verify=True, go_after=True):
+    def flash_firmware(self, filepath, address=None, verify=True, go_after=True, wait_for_port=False, auto_reset=False):
         """
         一键烧录固件（主流程）
         filepath: .bin 或 .hex 文件路径
@@ -450,7 +656,10 @@ class STM32Programmer:
             raise STM32Error(f"不支持的文件格式: {ext}（支持 .bin 和 .hex）")
 
         # 2. 连接
-        self.connect()
+        if auto_reset:
+            self.reset_to_bootloader()
+        else:
+            self.connect(wait_for_port=wait_for_port)
 
         # 3. 获取芯片信息
         self.get_info()
@@ -503,15 +712,33 @@ def main():
   python stm32_uart_programmer.py -p /dev/ttyUSB0 --read -a 0x08000000 -s 1024 -o dump.bin
 
 烧录前准备:
-  1. 将 BOOT0 引脚拉高（接 VCC 或跳线帽）
-  2. 复位芯片（按复位键或断电重启）
-  3. 连接串口（TX→RX, RX→TX, GND→GND）
-  4. 运行本工具烧录
-  5. 烧录完成后将 BOOT0 恢复低电平，复位即可正常运行
+  方式A - 手动模式:
+    1. 将 BOOT0 引脚拉高（接 VCC 或跳线帽）
+    2. 复位芯片（按复位键或断电重启）
+    3. 连接串口（TX→RX, RX→TX, GND→GND）
+    4. 运行本工具烧录
+    5. 烧录完成后将 BOOT0 恢复低电平，复位即可正常运行
+
+  方式B - 自动模式 (--auto-reset):
+    接线: TX→RX, RX→TX, DTR→RESET, RTS→BOOT0, GND→GND
+    程序自动控制 BOOT0/RESET 引脚，无需手动操作
+    如极性不对可加 --invert-reset / --invert-boot0
 """)
 
     parser.add_argument('-p', '--port', required=True,
                         help='串口设备 (如 /dev/ttyUSB0 或 COM3)')
+    parser.add_argument('--wait-port', action='store_true',
+                        help='启动时等待串口设备出现（用于断电重连场景）')
+    parser.add_argument('--auto-reset', action='store_true',
+                        help='通过DTR/RTS自动复位芯片进入Bootloader（需硬件连接DTR→RESET, RTS→BOOT0）')
+    parser.add_argument('--reset-pin', default='dtr', choices=['dtr', 'rts'],
+                        help='RESET连接的引脚 (默认 dtr)')
+    parser.add_argument('--boot0-pin', default='rts', choices=['dtr', 'rts'],
+                        help='BOOT0连接的引脚 (默认 rts)')
+    parser.add_argument('--invert-reset', action='store_true',
+                        help='反转RESET引脚极性')
+    parser.add_argument('--invert-boot0', action='store_true',
+                        help='反转BOOT0引脚极性')
     parser.add_argument('-b', '--baudrate', type=int, default=115200,
                         help='波特率 (默认 115200)')
     parser.add_argument('-f', '--firmware',
@@ -542,19 +769,30 @@ def main():
             and not args.unprotect_write and not args.unprotect_read:
         parser.error("请指定固件文件 (-f) 或操作模式 (--erase-only/--read/--unprotect-*)")
 
-    programmer = STM32Programmer(args.port, args.baudrate)
+    programmer = STM32Programmer(
+        args.port, args.baudrate,
+        reset_pin=args.reset_pin,
+        boot0_pin=args.boot0_pin,
+        invert_reset=args.invert_reset,
+        invert_boot0=args.invert_boot0
+    )
 
     try:
         if args.firmware:
             # 烧录模式
             programmer.flash_firmware(
                 filepath=args.firmware,
+                wait_for_port=args.wait_port,
+                auto_reset=args.auto_reset,
                 address=args.address,
                 verify=not args.no_verify,
                 go_after=not args.no_go
             )
         elif args.erase_only:
-            programmer.connect()
+            if args.auto_reset:
+                programmer.reset_to_bootloader()
+            else:
+                programmer.connect(wait_for_port=args.wait_port)
             programmer.get_info()
             programmer.erase_flash()
             print("[✓] 全片擦除完成")
@@ -563,7 +801,10 @@ def main():
                 args.address = DEFAULT_FLASH_START
             if not args.size:
                 parser.error("读取模式需要指定大小 (-s)")
-            programmer.connect()
+            if args.auto_reset:
+                programmer.reset_to_bootloader()
+            else:
+                programmer.connect(wait_for_port=args.wait_port)
             programmer.get_info()
             data = programmer.read_memory(args.address, args.size)
             if args.output:
@@ -577,17 +818,31 @@ def main():
                     ascii_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data[i:i+16])
                     print(f"  {args.address + i:08X}: {hex_str:<48s} {ascii_str}")
         elif args.unprotect_write:
-            programmer.connect()
+            if args.auto_reset:
+                programmer.reset_to_bootloader()
+            else:
+                programmer.connect(wait_for_port=args.wait_port)
             programmer.write_unprotect()
         elif args.unprotect_read:
-            programmer.connect()
+            if args.auto_reset:
+                programmer.reset_to_bootloader()
+            else:
+                programmer.connect(wait_for_port=args.wait_port)
             programmer.readout_unprotect()
 
     except STM32Error as e:
         print(f"\n[✗] 错误: {e}", file=sys.stderr)
         sys.exit(1)
     except serial.SerialException as e:
-        print(f"\n[✗] 串口错误: {e}", file=sys.stderr)
+        # 串口断开可能是断电重连，尝试等待恢复
+        print(f"\n[!] 串口断开: {e}")
+        print("[*] 如果是断电复位，请重新上电（保持BOOT0拉高）...")
+        try:
+            programmer.reconnect(wait_timeout=30)
+            print("[✓] 重新连接成功，但需要重新运行烧录命令")
+        except Exception:
+            pass
+        print(f"[✗] 串口错误: {e}", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
         print("\n[!] 用户中断")
