@@ -337,3 +337,16 @@ python stm32_stlink_programmer.py -f firmware.bin -a 0x08000000
 # 删除本机令牌并退出登录
 python stm32_stlink_programmer.py --logout
 ```
+
+### 登录后的固件选择与版本确认
+
+用户登录成功后，`stm32_stlink_programmer.py` 会进入固件选择界面：
+
+1. 从服务器加载“机型”；
+2. 根据机型加载“零部件”；
+3. 零部件的 `purpose` 为空时隐藏“用途”，非空时按 `|` 分割供用户选择；
+4. “程序”可选 `bootload`、`app`、`parameter`；
+5. 点击“查询固件”调用 `/openapi/versions/latest`；
+6. 查询成功后显示文件名、MD5、文件大小、版本，用户确认后才继续执行 ST-Link 操作。
+
+列表和查询接口均自动在 URL 中携带当前登录的 `api_token`，最新版本查询固定带 `status=1`。

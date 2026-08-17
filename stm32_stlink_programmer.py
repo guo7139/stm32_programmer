@@ -9,6 +9,7 @@ import getpass, json, tempfile, threading
 from pathlib import Path
 from urllib import error as urllib_error
 from urllib import request as urllib_request
+from urllib import parse as urllib_parse
 
 # ============ libusb 后端 ============
 _usb_backend = None
@@ -192,6 +193,76 @@ class AuthClient:
         """调用其他权限API，自动携带Authorization和api_token请求头。"""
         return self._send(path, method=method, payload=payload, require_token=True)
 
+    def request_with_token_query(self, path, params=None):
+        """调用要求通过token查询参数鉴权的GET接口。"""
+        if not self.api_token:
+            raise AuthenticationError('尚未登录')
+        query = dict(params or {})
+        query['token'] = self.api_token
+        separator = '&' if '?' in path else '?'
+        return self.request(path + separator + urllib_parse.urlencode(query))
+
+    @staticmethod
+    def _as_list(result):
+        """兼容接口直接返回数组或以data/list/items包装数组。"""
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            for key in ('data', 'list', 'items', 'rows'):
+                if isinstance(result.get(key), list):
+                    return result[key]
+        return []
+
+    def get_models_and_parts(self):
+        """获取机型基础数据；接口返回零部件时同时按model_code归纳机型。"""
+        records = self._as_list(self.request_with_token_query('/api/parts'))
+        models = []
+        seen = set()
+        for item in records:
+            code = str(item.get('model_code') or '').strip()
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            models.append({
+                'id': item.get('id'),
+                'model_code': code,
+                'model_name': str(item.get('model_name') or code),
+                'status': item.get('status'),
+                'status_text': item.get('status_text') or '',
+            })
+        return models, records
+
+    def get_parts(self, model_code, initial_records=None):
+        """按机型获取零部件；若服务器忽略筛选参数则在客户端再次筛选。"""
+        records = self._as_list(self.request_with_token_query(
+            '/api/parts', {'model_code': model_code}))
+        if not records and initial_records:
+            records = initial_records
+        return [item for item in records
+                if str(item.get('model_code') or '').strip() == model_code
+                and item.get('part_no')]
+
+    @staticmethod
+    def split_purposes(part):
+        """将零部件purpose字段按|分割并去除空项。"""
+        return [item.strip() for item in str(part.get('purpose') or '').split('|')
+                if item.strip()]
+
+    def get_latest_version(self, model_code, part_no, purpose, program):
+        """查询已发布的最新固件版本。无匹配数据时返回None。"""
+        result = self.request_with_token_query('/openapi/versions/latest', {
+            'model_code': model_code,
+            'part_no': part_no,
+            'purpose': purpose or '',
+            'program': program,
+            'status': 1,
+        })
+        if result is None:
+            return None
+        if isinstance(result, dict) and 'data' in result:
+            result = result.get('data')
+        return result if isinstance(result, dict) and result else None
+
 
 def show_login_dialog(auth, initial_username=''):
     """显示用户名/密码登录窗口。成功返回True，取消返回False。"""
@@ -286,6 +357,300 @@ def show_login_dialog(auth, initial_username=''):
     (password_entry if initial_username else username_entry).focus_set()
     root.mainloop()
     return result['ok']
+
+
+def show_firmware_selection_dialog(auth):
+    """显示机型/零部件/用途/程序选择与固件版本确认窗口。"""
+    try:
+        import tkinter as tk
+        from tkinter import messagebox, ttk
+    except ImportError:
+        return terminal_firmware_selection(auth)
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        return terminal_firmware_selection(auth)
+
+    root.title('STM32 ST-Link 烧录工具 - 固件选择')
+    root.resizable(False, False)
+    result = {'confirmed': False, 'selection': None, 'version': None}
+    state = {'models': [], 'parts': [], 'initial_records': [], 'version': None}
+
+    frame = ttk.Frame(root, padding=20)
+    frame.grid(row=0, column=0, sticky='nsew')
+    ttk.Label(frame, text='选择固件', font=('', 16, 'bold')).grid(
+        row=0, column=0, columnspan=3, pady=(0, 14))
+
+    model_var, part_var = tk.StringVar(), tk.StringVar()
+    purpose_var, program_var = tk.StringVar(), tk.StringVar(value='app')
+    status_var = tk.StringVar(value='正在从服务器加载机型...')
+
+    ttk.Label(frame, text='机型：').grid(row=1, column=0, sticky='e', pady=5)
+    model_box = ttk.Combobox(frame, textvariable=model_var, state='readonly', width=42)
+    model_box.grid(row=1, column=1, columnspan=2, sticky='ew', pady=5)
+    ttk.Label(frame, text='零部件：').grid(row=2, column=0, sticky='e', pady=5)
+    part_box = ttk.Combobox(frame, textvariable=part_var, state='readonly', width=42)
+    part_box.grid(row=2, column=1, columnspan=2, sticky='ew', pady=5)
+
+    purpose_label = ttk.Label(frame, text='用途：')
+    purpose_box = ttk.Combobox(frame, textvariable=purpose_var, state='readonly', width=42)
+    ttk.Label(frame, text='程序：').grid(row=4, column=0, sticky='e', pady=5)
+    program_box = ttk.Combobox(frame, textvariable=program_var, state='readonly',
+                               values=('bootload', 'app', 'parameter'), width=42)
+    program_box.grid(row=4, column=1, columnspan=2, sticky='ew', pady=5)
+
+    query_button = ttk.Button(frame, text='查询固件')
+    query_button.grid(row=5, column=1, pady=(12, 8), sticky='w')
+    ttk.Label(frame, textvariable=status_var, foreground='#555555').grid(
+        row=6, column=0, columnspan=3, pady=(2, 10))
+
+    info_frame = ttk.LabelFrame(frame, text='固件版本信息', padding=12)
+    info_frame.grid(row=7, column=0, columnspan=3, sticky='ew')
+    info_vars = {key: tk.StringVar(value='-') for key in
+                 ('file_name', 'file_md5', 'file_size', 'version')}
+    labels = [('文件名', 'file_name'), ('MD5', 'file_md5'),
+              ('文件大小', 'file_size'), ('版本', 'version')]
+    for row, (text, key) in enumerate(labels):
+        ttk.Label(info_frame, text=text + '：').grid(row=row, column=0, sticky='ne', pady=3)
+        ttk.Label(info_frame, textvariable=info_vars[key], wraplength=390).grid(
+            row=row, column=1, sticky='w', pady=3)
+
+    button_frame = ttk.Frame(frame)
+    button_frame.grid(row=8, column=0, columnspan=3, pady=(14, 0))
+    confirm_button = ttk.Button(button_frame, text='确认', state='disabled', width=12)
+    confirm_button.grid(row=0, column=0, padx=5)
+    ttk.Button(button_frame, text='取消', command=root.destroy, width=12).grid(
+        row=0, column=1, padx=5)
+
+    def model_display(item):
+        name = item.get('model_name') or item.get('model_code') or ''
+        code = item.get('model_code') or ''
+        status = item.get('status_text') or ''
+        return f'{code} - {name}' + (f'（{status}）' if status else '')
+
+    def part_display(item):
+        number = item.get('part_no') or ''
+        name = item.get('part_name') or ''
+        status = item.get('status_text') or ''
+        return f'{number} - {name}' + (f'（{status}）' if status else '')
+
+    def selected_model():
+        index = model_box.current()
+        return state['models'][index] if 0 <= index < len(state['models']) else None
+
+    def selected_part():
+        index = part_box.current()
+        return state['parts'][index] if 0 <= index < len(state['parts']) else None
+
+    def clear_version():
+        state['version'] = None
+        confirm_button.configure(state='disabled')
+        for var in info_vars.values():
+            var.set('-')
+
+    def set_busy(busy, message=None):
+        widget_state = 'disabled' if busy else 'readonly'
+        model_box.configure(state=widget_state)
+        part_box.configure(state=widget_state)
+        program_box.configure(state=widget_state)
+        if purpose_box.winfo_ismapped():
+            purpose_box.configure(state=widget_state)
+        query_button.configure(state='disabled' if busy else 'normal')
+        if message:
+            status_var.set(message)
+
+    def show_purpose(part):
+        raw = str((part or {}).get('purpose') or '').strip()
+        purposes = [value.strip() for value in raw.split('|') if value.strip()]
+        purpose_var.set(purposes[0] if purposes else '')
+        purpose_box.configure(values=purposes)
+        if purposes:
+            purpose_label.grid(row=3, column=0, sticky='e', pady=5)
+            purpose_box.grid(row=3, column=1, columnspan=2, sticky='ew', pady=5)
+        else:
+            purpose_label.grid_remove()
+            purpose_box.grid_remove()
+
+    def parts_loaded(parts):
+        state['parts'] = parts
+        part_box.configure(values=[part_display(item) for item in parts])
+        if parts:
+            part_box.current(0)
+            show_purpose(parts[0])
+            status_var.set(f'已加载 {len(parts)} 个零部件')
+        else:
+            part_var.set('')
+            show_purpose(None)
+            status_var.set('该机型没有可选零部件')
+        set_busy(False)
+
+    def operation_failed(message):
+        set_busy(False)
+        status_var.set('请求失败')
+        messagebox.showerror('服务器请求失败', message, parent=root)
+
+    def on_model_changed(event=None):
+        model = selected_model()
+        clear_version()
+        if not model:
+            return
+        set_busy(True, '正在加载零部件...')
+        def worker():
+            try:
+                parts = auth.get_parts(model['model_code'], state['initial_records'])
+            except Exception as exc:
+                root.after(0, lambda message=str(exc): operation_failed(message))
+            else:
+                root.after(0, lambda values=parts: parts_loaded(values))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_part_changed(event=None):
+        clear_version()
+        show_purpose(selected_part())
+
+    def data_loaded(models, records):
+        state['models'], state['initial_records'] = models, records
+        model_box.configure(values=[model_display(item) for item in models])
+        set_busy(False)
+        if not models:
+            status_var.set('服务器未返回机型数据')
+            messagebox.showwarning('没有机型', '服务器未返回可选机型', parent=root)
+            return
+        model_box.current(0)
+        on_model_changed()
+
+    def load_data():
+        set_busy(True, '正在从服务器加载机型...')
+        def worker():
+            try:
+                models, records = auth.get_models_and_parts()
+            except Exception as exc:
+                root.after(0, lambda message=str(exc): operation_failed(message))
+            else:
+                root.after(0, lambda: data_loaded(models, records))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def version_loaded(version):
+        set_busy(False)
+        if not version:
+            clear_version()
+            status_var.set('未查询到匹配固件')
+            messagebox.showinfo('查询结果', '没有匹配的已发布固件', parent=root)
+            return
+        state['version'] = version
+        size = version.get('file_size')
+        info_vars['file_name'].set(str(version.get('file_name') or ''))
+        info_vars['file_md5'].set(str(version.get('file_md5') or ''))
+        info_vars['file_size'].set(f'{size} 字节' if size is not None else '')
+        info_vars['version'].set(str(version.get('version') or ''))
+        status_var.set('查询成功，请核对固件信息后点击确认')
+        confirm_button.configure(state='normal')
+
+    def query_version():
+        model, part = selected_model(), selected_part()
+        if not model or not part:
+            messagebox.showwarning('查询提示', '请选择机型和零部件', parent=root)
+            return
+        program = program_var.get().strip()
+        if not program:
+            messagebox.showwarning('查询提示', '请选择程序', parent=root)
+            return
+        clear_version()
+        set_busy(True, '正在查询最新固件...')
+        selection = {'model_code': model['model_code'], 'part_no': part['part_no'],
+                     'purpose': purpose_var.get().strip(), 'program': program,
+                     'status': 1}
+        def worker():
+            try:
+                version = auth.get_latest_version(
+                    selection['model_code'], selection['part_no'],
+                    selection['purpose'], selection['program'])
+            except Exception as exc:
+                root.after(0, lambda message=str(exc): operation_failed(message))
+            else:
+                result['selection'] = selection
+                root.after(0, lambda value=version: version_loaded(value))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def confirm():
+        if not state['version']:
+            return
+        if not messagebox.askyesno(
+                '确认固件',
+                f"文件名：{state['version'].get('file_name', '')}\n"
+                f"MD5：{state['version'].get('file_md5', '')}\n"
+                f"文件大小：{state['version'].get('file_size', '')} 字节\n"
+                f"版本：{state['version'].get('version', '')}\n\n确认使用该固件？",
+                parent=root):
+            return
+        result['confirmed'] = True
+        result['version'] = state['version']
+        root.destroy()
+
+    query_button.configure(command=query_version)
+    confirm_button.configure(command=confirm)
+    model_box.bind('<<ComboboxSelected>>', on_model_changed)
+    part_box.bind('<<ComboboxSelected>>', on_part_changed)
+    program_box.bind('<<ComboboxSelected>>', lambda event: clear_version())
+    root.protocol('WM_DELETE_WINDOW', root.destroy)
+    root.bind('<Escape>', lambda event: root.destroy())
+    root.update_idletasks()
+    x = max((root.winfo_screenwidth() - root.winfo_width()) // 2, 0)
+    y = max((root.winfo_screenheight() - root.winfo_height()) // 2, 0)
+    root.geometry(f'+{x}+{y}')
+    load_data()
+    root.mainloop()
+    return result if result['confirmed'] else None
+
+
+def terminal_firmware_selection(auth):
+    """无图形环境时的固件选择流程。"""
+    try:
+        models, records = auth.get_models_and_parts()
+        if not models:
+            print('[✗] 服务器未返回机型数据', file=sys.stderr)
+            return None
+        print('机型:')
+        for i, item in enumerate(models, 1):
+            print(f"  {i}. {item['model_code']} - {item.get('model_name', '')}")
+        model = models[int(input('请选择机型编号: ')) - 1]
+        parts = auth.get_parts(model['model_code'], records)
+        if not parts:
+            print('[✗] 该机型没有可选零部件', file=sys.stderr)
+            return None
+        print('零部件:')
+        for i, item in enumerate(parts, 1):
+            print(f"  {i}. {item['part_no']} - {item.get('part_name', '')}")
+        part = parts[int(input('请选择零部件编号: ')) - 1]
+        purposes = [v.strip() for v in str(part.get('purpose') or '').split('|') if v.strip()]
+        purpose = ''
+        if purposes:
+            print('用途:')
+            for i, value in enumerate(purposes, 1):
+                print(f'  {i}. {value}')
+            purpose = purposes[int(input('请选择用途编号: ')) - 1]
+        programs = ['bootload', 'app', 'parameter']
+        print('程序:')
+        for i, value in enumerate(programs, 1):
+            print(f'  {i}. {value}')
+        program = programs[int(input('请选择程序编号: ')) - 1]
+        version = auth.get_latest_version(model['model_code'], part['part_no'], purpose, program)
+    except (AuthenticationError, ValueError, IndexError) as e:
+        print(f'[✗] 固件查询失败: {e}', file=sys.stderr)
+        return None
+    if not version:
+        print('[✗] 没有匹配的已发布固件', file=sys.stderr)
+        return None
+    print(f"文件名: {version.get('file_name', '')}")
+    print(f"MD5: {version.get('file_md5', '')}")
+    print(f"文件大小: {version.get('file_size', '')} 字节")
+    print(f"版本: {version.get('version', '')}")
+    if input('确认使用该固件？[y/N]: ').strip().lower() not in ('y', 'yes'):
+        return None
+    return {'confirmed': True,
+            'selection': {'model_code': model['model_code'], 'part_no': part['part_no'],
+                          'purpose': purpose, 'program': program, 'status': 1},
+            'version': version}
 
 
 def terminal_login(auth, initial_username=''):
@@ -1302,9 +1667,19 @@ def main():
             print("[✗] 未登录，软件不能使用", file=sys.stderr)
             sys.exit(1)
         print("[✓] 登录成功，已获得使用权限")
-        if args.login and not any([args.firmware, args.info, args.erase,
-                                   args.read, args.list]):
-            return
+
+    # 登录后必须选择并确认服务器上的固件版本。
+    firmware_choice = show_firmware_selection_dialog(auth)
+    if not firmware_choice:
+        print("[✗] 未确认固件，操作已取消", file=sys.stderr)
+        sys.exit(1)
+    selected = firmware_choice['selection']
+    version = firmware_choice['version']
+    print(f"[✓] 已确认固件: {version.get('file_name', '')} "
+          f"({version.get('version', '')})")
+    if args.login and not any([args.firmware, args.info, args.erase,
+                               args.read, args.list]):
+        return
 
     # 列出设备
     if args.list:
