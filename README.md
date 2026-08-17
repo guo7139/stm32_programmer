@@ -319,3 +319,21 @@ python stm32_uart_programmer.py --logout
 Authorization: Bearer <api_token>
 api_token: <api_token>
 ```
+
+### ST-Link 图形登录界面
+
+运行 `stm32_stlink_programmer.py` 时，如果本机尚未保存 `api_token`，程序会自动显示用户名和密码登录窗口。密码采用掩码显示，登录成功后才能执行设备列表、芯片信息、烧录、擦除和读取操作。
+
+```bash
+# 强制显示登录窗口并重新登录
+python stm32_stlink_programmer.py --login
+
+# 登录窗口预填用户名
+python stm32_stlink_programmer.py --login --username admin
+
+# 登录后烧录
+python stm32_stlink_programmer.py -f firmware.bin -a 0x08000000
+
+# 删除本机令牌并退出登录
+python stm32_stlink_programmer.py --logout
+```

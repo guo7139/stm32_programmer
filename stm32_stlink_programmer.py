@@ -5,7 +5,10 @@ STM32 ST-Link SWD Programmer
 """
 
 import sys, os, struct, time, argparse
+import getpass, json, tempfile, threading
 from pathlib import Path
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 # ============ libusb 后端 ============
 _usb_backend = None
@@ -35,6 +38,11 @@ STLINK_V2_PID = 0x3748
 STLINK_V21_PID = 0x374B
 STLINK_V3_PID = 0x374F
 STLINK_PIDS = [STLINK_V2_PID, STLINK_V21_PID, STLINK_V3_PID]
+
+# 用户认证服务器
+AUTH_SERVER = "http://192.168.60.241:9100"
+AUTH_LOGIN_PATH = "/api/login"
+AUTH_TIMEOUT = 10
 
 CMD_GET_VERSION = 0xF1
 CMD_DEBUG = 0xF2
@@ -85,6 +93,216 @@ CHIP_IDS = {
 
 class STM32Error(Exception):
     pass
+
+
+class AuthenticationError(Exception):
+    """登录或HTTP权限验证错误。"""
+    pass
+
+
+class AuthClient:
+    """登录、保存api_token，并为后续HTTP接口自动携带令牌。"""
+
+    def __init__(self, server=AUTH_SERVER, timeout=AUTH_TIMEOUT):
+        self.server = server.rstrip('/')
+        self.timeout = timeout
+        self.token_file = self._get_token_file()
+        self.api_token = self._load_token()
+
+    @staticmethod
+    def _get_token_file():
+        if os.name == 'nt':
+            base = Path(os.environ.get('APPDATA', Path.home() / 'AppData' / 'Roaming'))
+        else:
+            base = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config'))
+        return base / 'stm32_programmer' / 'auth.json'
+
+    def _load_token(self):
+        try:
+            data = json.loads(self.token_file.read_text(encoding='utf-8'))
+            token = data.get('api_token')
+            return token if isinstance(token, str) and token else None
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def _save_token(self, token):
+        self.token_file.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(prefix='auth-', suffix='.tmp',
+                                         dir=str(self.token_file.parent))
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump({'api_token': token}, f)
+            try:
+                os.chmod(temp_name, 0o600)
+            except OSError:
+                pass
+            os.replace(temp_name, self.token_file)
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
+
+    def logout(self):
+        self.api_token = None
+        try:
+            self.token_file.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _send(self, path, method='GET', payload=None, require_token=True):
+        headers = {'Accept': 'application/json'}
+        body = None
+        if payload is not None:
+            body = json.dumps(payload).encode('utf-8')
+            headers['Content-Type'] = 'application/json'
+        if require_token:
+            if not self.api_token:
+                raise AuthenticationError('尚未登录')
+            headers['Authorization'] = f'Bearer {self.api_token}'
+            headers['api_token'] = self.api_token
+        req = urllib_request.Request(self.server + path, data=body,
+                                     headers=headers, method=method)
+        try:
+            with urllib_request.urlopen(req, timeout=self.timeout) as response:
+                raw = response.read().decode('utf-8')
+        except urllib_error.HTTPError as e:
+            detail = e.read().decode('utf-8', errors='replace')
+            raise AuthenticationError(
+                f'服务器返回 HTTP {e.code}: {detail or e.reason}') from e
+        except urllib_error.URLError as e:
+            raise AuthenticationError(
+                f'无法连接登录服务器 {self.server}: {e.reason}') from e
+        try:
+            return json.loads(raw) if raw else {}
+        except json.JSONDecodeError as e:
+            raise AuthenticationError('服务器返回的不是有效 JSON') from e
+
+    def login(self, username, password):
+        result = self._send(AUTH_LOGIN_PATH, method='POST',
+                            payload={'username': username, 'password': password},
+                            require_token=False)
+        token = result.get('api_token')
+        if result.get('ok') is not True or not isinstance(token, str) or not token:
+            raise AuthenticationError(
+                result.get('message') or result.get('error') or '用户名或密码错误')
+        self.api_token = token
+        self._save_token(token)
+        return result
+
+    def request(self, path, method='GET', payload=None):
+        """调用其他权限API，自动携带Authorization和api_token请求头。"""
+        return self._send(path, method=method, payload=payload, require_token=True)
+
+
+def show_login_dialog(auth, initial_username=''):
+    """显示用户名/密码登录窗口。成功返回True，取消返回False。"""
+    try:
+        import tkinter as tk
+        from tkinter import messagebox, ttk
+    except ImportError:
+        return terminal_login(auth, initial_username)
+
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        return terminal_login(auth, initial_username)
+
+    root.title('STM32 ST-Link 烧录工具 - 用户登录')
+    root.resizable(False, False)
+    root.protocol('WM_DELETE_WINDOW', root.destroy)
+    result = {'ok': False}
+
+    frame = ttk.Frame(root, padding=22)
+    frame.grid(row=0, column=0, sticky='nsew')
+    ttk.Label(frame, text='用户登录', font=('', 16, 'bold')).grid(
+        row=0, column=0, columnspan=2, pady=(0, 16))
+    ttk.Label(frame, text='服务器：').grid(row=1, column=0, sticky='e', pady=5)
+    server_var = tk.StringVar(value=auth.server)
+    server_entry = ttk.Entry(frame, textvariable=server_var, width=34, state='readonly')
+    server_entry.grid(row=1, column=1, sticky='ew', pady=5)
+    ttk.Label(frame, text='用户名：').grid(row=2, column=0, sticky='e', pady=5)
+    username_var = tk.StringVar(value=initial_username)
+    username_entry = ttk.Entry(frame, textvariable=username_var, width=34)
+    username_entry.grid(row=2, column=1, sticky='ew', pady=5)
+    ttk.Label(frame, text='密码：').grid(row=3, column=0, sticky='e', pady=5)
+    password_var = tk.StringVar()
+    password_entry = ttk.Entry(frame, textvariable=password_var, show='●', width=34)
+    password_entry.grid(row=3, column=1, sticky='ew', pady=5)
+    status_var = tk.StringVar(value='请输入用户名和密码')
+    status_label = ttk.Label(frame, textvariable=status_var, foreground='#555555')
+    status_label.grid(row=4, column=0, columnspan=2, pady=(8, 4))
+    buttons = ttk.Frame(frame)
+    buttons.grid(row=5, column=0, columnspan=2, pady=(10, 0))
+
+    def finish_login(user):
+        result['ok'] = True
+        result['user'] = user
+        root.destroy()
+
+    def set_busy(busy):
+        state = 'disabled' if busy else 'normal'
+        login_button.configure(state=state)
+        cancel_button.configure(state=state)
+        username_entry.configure(state=state)
+        password_entry.configure(state=state)
+
+    def submit(event=None):
+        username = username_var.get().strip()
+        password = password_var.get()
+        if not username or not password:
+            messagebox.showwarning('登录提示', '请输入用户名和密码', parent=root)
+            return
+        set_busy(True)
+        status_var.set('正在连接登录服务器...')
+
+        def worker():
+            try:
+                user = auth.login(username, password)
+            except AuthenticationError as exc:
+                root.after(0, lambda message=str(exc): login_failed(message))
+            except Exception as exc:
+                root.after(0, lambda message=f'登录失败：{exc}': login_failed(message))
+            else:
+                root.after(0, lambda: finish_login(user))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def login_failed(message):
+        set_busy(False)
+        password_var.set('')
+        status_var.set('登录失败，请重新输入')
+        messagebox.showerror('登录失败', message, parent=root)
+        password_entry.focus_set()
+
+    login_button = ttk.Button(buttons, text='登录', command=submit, width=12)
+    login_button.grid(row=0, column=0, padx=5)
+    cancel_button = ttk.Button(buttons, text='取消', command=root.destroy, width=12)
+    cancel_button.grid(row=0, column=1, padx=5)
+    root.bind('<Return>', submit)
+    root.bind('<Escape>', lambda event: root.destroy())
+    root.update_idletasks()
+    x = max((root.winfo_screenwidth() - root.winfo_width()) // 2, 0)
+    y = max((root.winfo_screenheight() - root.winfo_height()) // 2, 0)
+    root.geometry(f'+{x}+{y}')
+    (password_entry if initial_username else username_entry).focus_set()
+    root.mainloop()
+    return result['ok']
+
+
+def terminal_login(auth, initial_username=''):
+    """无图形环境时使用终端登录，密码不回显。"""
+    username = initial_username or input('用户名: ').strip()
+    if not username:
+        return False
+    password = getpass.getpass('密码: ')
+    if not password:
+        return False
+    try:
+        user = auth.login(username, password)
+    except AuthenticationError as e:
+        print(f'[✗] 登录失败: {e}', file=sys.stderr)
+        return False
+    print(f"[✓] 登录成功: {user.get('name') or user.get('username') or username}")
+    return True
 
 
 class IntelHexParser:
@@ -1051,7 +1269,10 @@ class STM32Programmer:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='STM32 ST-Link SWD 烧录工具')
+    parser = argparse.ArgumentParser(description='STM32 ST-Link SWD 烧录工具（需要用户登录）')
+    parser.add_argument('--login', action='store_true', help='显示登录界面并重新登录')
+    parser.add_argument('--username', help='登录界面预填用户名')
+    parser.add_argument('--logout', action='store_true', help='退出登录并删除本机api_token')
     parser.add_argument('-f', '--firmware', help='固件文件 (.hex/.bin)')
     parser.add_argument('-a', '--address', type=lambda x: int(x,0), help='起始地址')
     parser.add_argument('-i', '--info', action='store_true', help='芯片信息')
@@ -1066,6 +1287,24 @@ def main():
     parser.add_argument('--serial', help='多个ST-Link时按序列号选择(支持部分匹配)')
     parser.add_argument('-l', '--list', action='store_true', help='列出所有ST-Link设备')
     args = parser.parse_args()
+    auth = AuthClient()
+
+    if args.logout:
+        auth.logout()
+        print("[✓] 已退出登录，本机api_token已删除")
+        return
+
+    # --login 强制显示登录界面；没有令牌时，任何软件功能都先要求登录。
+    if args.login or not auth.api_token:
+        if args.login:
+            auth.logout()
+        if not show_login_dialog(auth, args.username or ''):
+            print("[✗] 未登录，软件不能使用", file=sys.stderr)
+            sys.exit(1)
+        print("[✓] 登录成功，已获得使用权限")
+        if args.login and not any([args.firmware, args.info, args.erase,
+                                   args.read, args.list]):
+            return
 
     # 列出设备
     if args.list:
