@@ -5,7 +5,7 @@ STM32 ST-Link SWD Programmer
 """
 
 import sys, os, struct, time, argparse
-import getpass, json, tempfile, threading
+import getpass, hashlib, json, tempfile, threading
 from pathlib import Path
 from urllib import error as urllib_error
 from urllib import request as urllib_request
@@ -248,6 +248,114 @@ class AuthClient:
         return [item.strip() for item in str(part.get('purpose') or '').split('|')
                 if item.strip()]
 
+    @staticmethod
+    def format_file_size(size):
+        """将字节数格式化为易读的B/KB/MB/GB。"""
+        try:
+            value = int(size)
+        except (TypeError, ValueError):
+            return '-'
+        units = ('B', 'KB', 'MB', 'GB', 'TB')
+        display = float(value)
+        unit = units[0]
+        for unit in units:
+            if display < 1024 or unit == units[-1]:
+                break
+            display /= 1024
+        return f'{int(display)} {unit}' if unit == 'B' else f'{display:.2f} {unit}'
+
+    @staticmethod
+    def parse_burn_address(value):
+        """校验并解析零部件接口返回的烧录地址。"""
+        text = str(value or '').strip()
+        if not text:
+            raise AuthenticationError('该零部件未配置烧录地址 burn_addr')
+        try:
+            address = int(text, 0)
+        except ValueError as exc:
+            raise AuthenticationError(f'烧录地址格式错误：{text}') from exc
+        if address < 0 or address > 0xFFFFFFFF:
+            raise AuthenticationError(f'烧录地址超出范围：{text}')
+        return address
+
+    def _firmware_directory(self):
+        if os.name == 'nt':
+            base = Path(os.environ.get('LOCALAPPDATA',
+                       Path.home() / 'AppData' / 'Local'))
+        else:
+            base = Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache'))
+        return base / 'stm32_programmer' / 'firmware'
+
+    def download_firmware(self, version, progress=None):
+        """下载固件并严格校验MD5和字节大小，成功后返回本地路径。"""
+        version_id = version.get('id')
+        expected_md5 = str(version.get('file_md5') or '').strip().lower()
+        try:
+            expected_size = int(version.get('file_size'))
+        except (TypeError, ValueError) as exc:
+            raise AuthenticationError('固件缺少有效的file_size，不能安全烧录') from exc
+        if version_id in (None, ''):
+            raise AuthenticationError('固件版本缺少id，无法下载')
+        if not expected_md5:
+            raise AuthenticationError('固件MD5为空，不能下载和烧录')
+        if expected_size < 0:
+            raise AuthenticationError('固件file_size无效，不能安全烧录')
+
+        raw_name = Path(str(version.get('file_name') or f'firmware-{version_id}.bin')).name
+        safe_name = ''.join(c for c in raw_name if c.isalnum() or c in '._-')
+        if not safe_name:
+            safe_name = f'firmware-{version_id}.bin'
+        directory = self._firmware_directory()
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / safe_name
+        fd, temp_name = tempfile.mkstemp(prefix='download-', suffix='.tmp', dir=str(directory))
+        os.close(fd)
+        query = urllib_parse.urlencode({'token': self.api_token})
+        url = self.server + f'/openapi/download/{urllib_parse.quote(str(version_id), safe="")}?{query}'
+        request = urllib_request.Request(url, headers={
+            'Accept': 'application/octet-stream',
+            'Authorization': f'Bearer {self.api_token}',
+            'api_token': self.api_token,
+        }, method='GET')
+        digest, total = hashlib.md5(), 0
+        try:
+            try:
+                response = urllib_request.urlopen(request, timeout=max(self.timeout, 30))
+            except urllib_error.HTTPError as exc:
+                detail = exc.read().decode('utf-8', errors='replace')
+                raise AuthenticationError(
+                    f'下载服务器返回 HTTP {exc.code}: {detail or exc.reason}') from exc
+            except urllib_error.URLError as exc:
+                raise AuthenticationError(f'无法下载固件：{exc.reason}') from exc
+            with response, open(temp_name, 'wb') as output:
+                while True:
+                    chunk = response.read(1024 * 256)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    digest.update(chunk)
+                    total += len(chunk)
+                    if progress:
+                        progress(total, expected_size)
+                output.flush()
+                os.fsync(output.fileno())
+            actual_md5 = digest.hexdigest().lower()
+            errors = []
+            if total != expected_size:
+                errors.append(f'文件大小不一致：期望 {expected_size} 字节，实际 {total} 字节')
+            if actual_md5 != expected_md5:
+                errors.append(f'MD5不一致：期望 {expected_md5}，实际 {actual_md5}')
+            if errors:
+                raise AuthenticationError('；'.join(errors))
+            os.replace(temp_name, target)
+            return str(target)
+        finally:
+            if os.path.exists(temp_name):
+                try:
+                    os.unlink(temp_name)
+                except OSError:
+                    pass
+
     def get_latest_version(self, model_code, part_no, purpose, program):
         """查询已发布的最新固件版本。无匹配数据时返回None。"""
         result = self.request_with_token_query('/openapi/versions/latest', {
@@ -373,7 +481,8 @@ def show_firmware_selection_dialog(auth):
 
     root.title('STM32 ST-Link 烧录工具 - 固件选择')
     root.resizable(False, False)
-    result = {'confirmed': False, 'selection': None, 'version': None}
+    result = {'confirmed': False, 'selection': None, 'version': None,
+              'downloaded_file': None, 'burn_addr': None}
     state = {'models': [], 'parts': [], 'initial_records': [], 'version': None}
 
     frame = ttk.Frame(root, padding=20)
@@ -407,9 +516,10 @@ def show_firmware_selection_dialog(auth):
     info_frame = ttk.LabelFrame(frame, text='固件版本信息', padding=12)
     info_frame.grid(row=7, column=0, columnspan=3, sticky='ew')
     info_vars = {key: tk.StringVar(value='-') for key in
-                 ('file_name', 'file_md5', 'file_size', 'version')}
+                 ('file_name', 'file_md5', 'file_size', 'version', 'burn_addr')}
     labels = [('文件名', 'file_name'), ('MD5', 'file_md5'),
-              ('文件大小', 'file_size'), ('版本', 'version')]
+              ('文件大小', 'file_size'), ('版本', 'version'),
+              ('烧录地址', 'burn_addr')]
     for row, (text, key) in enumerate(labels):
         ttk.Label(info_frame, text=text + '：').grid(row=row, column=0, sticky='ne', pady=3)
         ttk.Label(info_frame, textvariable=info_vars[key], wraplength=390).grid(
@@ -417,7 +527,7 @@ def show_firmware_selection_dialog(auth):
 
     button_frame = ttk.Frame(frame)
     button_frame.grid(row=8, column=0, columnspan=3, pady=(14, 0))
-    confirm_button = ttk.Button(button_frame, text='确认', state='disabled', width=12)
+    confirm_button = ttk.Button(button_frame, text='烧录', state='disabled', width=12)
     confirm_button.grid(row=0, column=0, padx=5)
     ttk.Button(button_frame, text='取消', command=root.destroy, width=12).grid(
         row=0, column=1, padx=5)
@@ -541,9 +651,10 @@ def show_firmware_selection_dialog(auth):
         size = version.get('file_size')
         info_vars['file_name'].set(str(version.get('file_name') or ''))
         info_vars['file_md5'].set(str(version.get('file_md5') or ''))
-        info_vars['file_size'].set(f'{size} 字节' if size is not None else '')
+        info_vars['file_size'].set(auth.format_file_size(size))
+        info_vars['burn_addr'].set(str((result.get('selection') or {}).get('burn_addr') or '-'))
         info_vars['version'].set(str(version.get('version') or ''))
-        status_var.set('查询成功，请核对固件信息后点击确认')
+        status_var.set('查询成功，请核对固件信息后点击烧录')
         confirm_button.configure(state='normal')
 
     def query_version():
@@ -559,7 +670,7 @@ def show_firmware_selection_dialog(auth):
         set_busy(True, '正在查询最新固件...')
         selection = {'model_code': model['model_code'], 'part_no': part['part_no'],
                      'purpose': purpose_var.get().strip(), 'program': program,
-                     'status': 1}
+                     'status': 1, 'burn_addr': str(part.get('burn_addr') or '').strip()}
         def worker():
             try:
                 version = auth.get_latest_version(
@@ -573,19 +684,61 @@ def show_firmware_selection_dialog(auth):
         threading.Thread(target=worker, daemon=True).start()
 
     def confirm():
-        if not state['version']:
+        version = state['version']
+        selection = result.get('selection') or {}
+        if not version:
+            return
+        burn_addr = str(selection.get('burn_addr') or '').strip()
+        try:
+            burn_address = auth.parse_burn_address(burn_addr)
+        except AuthenticationError as exc:
+            messagebox.showerror('无法烧录', str(exc), parent=root)
+            return
+        if not str(version.get('file_md5') or '').strip():
+            messagebox.showerror('无法下载', '固件MD5为空，不能下载和烧录', parent=root)
             return
         if not messagebox.askyesno(
-                '确认固件',
-                f"文件名：{state['version'].get('file_name', '')}\n"
-                f"MD5：{state['version'].get('file_md5', '')}\n"
-                f"文件大小：{state['version'].get('file_size', '')} 字节\n"
-                f"版本：{state['version'].get('version', '')}\n\n确认使用该固件？",
+                '确认烧录',
+                f"文件名：{version.get('file_name', '')}\n"
+                f"MD5：{version.get('file_md5', '')}\n"
+                f"文件大小：{auth.format_file_size(version.get('file_size'))}\n"
+                f"版本：{version.get('version', '')}\n"
+                f"烧录地址：{burn_addr}\n\n确认下载并烧录该固件？",
                 parent=root):
             return
+        set_busy(True, '正在下载并校验固件...')
+        confirm_button.configure(state='disabled')
+
+        def progress(received, expected):
+            if expected > 0:
+                text = f'正在下载固件... {received * 100 // expected}%'
+            else:
+                text = f'正在下载固件... {auth.format_file_size(received)}'
+            root.after(0, lambda value=text: status_var.set(value))
+
+        def worker():
+            try:
+                downloaded = auth.download_firmware(version, progress=progress)
+            except Exception as exc:
+                root.after(0, lambda message=str(exc): download_failed(message))
+            else:
+                root.after(0, lambda path=downloaded, address=burn_address:
+                           download_succeeded(path, address))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def download_failed(message):
+        set_busy(False)
+        confirm_button.configure(state='normal')
+        status_var.set('固件下载或校验失败，未执行烧录')
+        messagebox.showerror('固件文件错误', message, parent=root)
+
+    def download_succeeded(path, burn_addr):
         result['confirmed'] = True
         result['version'] = state['version']
-        root.destroy()
+        result['downloaded_file'] = path
+        result['burn_addr'] = burn_addr
+        status_var.set('下载和校验成功，准备烧录...')
+        root.after(100, root.destroy)
 
     query_button.configure(command=query_version)
     confirm_button.configure(command=confirm)
@@ -641,16 +794,29 @@ def terminal_firmware_selection(auth):
     if not version:
         print('[✗] 没有匹配的已发布固件', file=sys.stderr)
         return None
+    burn_addr = str(part.get('burn_addr') or '').strip()
     print(f"文件名: {version.get('file_name', '')}")
     print(f"MD5: {version.get('file_md5', '')}")
-    print(f"文件大小: {version.get('file_size', '')} 字节")
+    print(f"文件大小: {auth.format_file_size(version.get('file_size'))}")
     print(f"版本: {version.get('version', '')}")
-    if input('确认使用该固件？[y/N]: ').strip().lower() not in ('y', 'yes'):
+    print(f"烧录地址: {burn_addr or '(未配置)'}")
+    if input('确认下载并烧录该固件？[y/N]: ').strip().lower() not in ('y', 'yes'):
+        return None
+    try:
+        parsed_addr = auth.parse_burn_addr(burn_addr)
+        downloaded = auth.download_firmware(
+            version, progress=lambda received, total:
+            print(f'\r下载: {auth.format_file_size(received)} / '
+                  f'{auth.format_file_size(total)}', end='', flush=True))
+        print()
+    except AuthenticationError as e:
+        print(f'\n[✗] 固件文件错误: {e}；未执行烧录', file=sys.stderr)
         return None
     return {'confirmed': True,
             'selection': {'model_code': model['model_code'], 'part_no': part['part_no'],
                           'purpose': purpose, 'program': program, 'status': 1},
-            'version': version}
+            'version': version, 'downloaded_file': downloaded,
+            'burn_addr': parsed_addr}
 
 
 def terminal_login(auth, initial_username=''):
@@ -1675,11 +1841,12 @@ def main():
         sys.exit(1)
     selected = firmware_choice['selection']
     version = firmware_choice['version']
-    print(f"[✓] 已确认固件: {version.get('file_name', '')} "
+    downloaded_file = firmware_choice.get('downloaded_file')
+    burn_addr = firmware_choice.get('burn_addr')
+    print(f"[✓] 固件下载校验通过: {version.get('file_name', '')} "
           f"({version.get('version', '')})")
-    if args.login and not any([args.firmware, args.info, args.erase,
-                               args.read, args.list]):
-        return
+    print(f"[*] 烧录文件: {downloaded_file}")
+    print(f"[*] 烧录地址: 0x{burn_addr:08X}")
 
     # 列出设备
     if args.list:
@@ -1692,13 +1859,16 @@ def main():
                 print(f"  {i}. ST-Link {name} (PID: 0x{pid:04X}) 序列号: {sn or '(无)'}")
         return
 
-    if not any([args.firmware, args.info, args.erase, args.read]):
-        parser.print_help()
-        return
-
+    # 用户点击“烧录”后，服务器下载并校验通过的文件优先用于烧录；
+    # 等效于: python stm32_stlink_programmer.py -f 下载文件 -a 烧录地址
     prog = STM32Programmer(serial=args.serial, index=args.device)
     try:
-        if args.firmware:
+        if downloaded_file:
+            if not os.path.isfile(downloaded_file):
+                raise STM32Error(f"下载的固件文件不存在: {downloaded_file}")
+            prog.flash_firmware(downloaded_file, burn_addr,
+                                not args.no_verify, not args.no_run, args.chip)
+        elif args.firmware:
             if not os.path.isfile(args.firmware):
                 raise STM32Error(f"文件不存在: {args.firmware}")
             prog.flash_firmware(args.firmware, args.address,

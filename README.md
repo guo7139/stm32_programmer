@@ -350,3 +350,22 @@ python stm32_stlink_programmer.py --logout
 6. 查询成功后显示文件名、MD5、文件大小、版本，用户确认后才继续执行 ST-Link 操作。
 
 列表和查询接口均自动在 URL 中携带当前登录的 `api_token`，最新版本查询固定带 `status=1`。
+
+### 固件下载、校验与烧录
+
+查询到固件后，界面按钮显示为“烧录”，并显示文件名、MD5、自动换算后的文件大小、版本和零部件接口返回的 `burn_addr`。
+
+点击“烧录”后，程序执行以下安全流程：
+
+1. 使用版本记录的 `id` 请求 `/openapi/download/{id}?token=<api_token>`；
+2. 将固件下载到本机应用缓存目录；
+3. 计算下载文件的实际 MD5 和字节大小；
+4. 与版本接口返回的 `file_md5`、`file_size` 严格比较；
+5. 任一不一致时删除错误文件、显示错误并停止，不执行烧录；
+6. 校验通过后，使用下载文件和零部件的 `burn_addr` 调用 ST-Link 烧录流程。
+
+Windows 下载目录：
+
+```text
+%LOCALAPPDATA%\stm32_programmer\firmware
+```
