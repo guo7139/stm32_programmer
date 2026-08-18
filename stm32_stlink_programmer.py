@@ -367,15 +367,23 @@ class AuthClient:
                 except OSError:
                     pass
 
-    def get_latest_version(self, model_code, part_no, purpose, program):
-        """查询已发布的最新固件版本。无匹配数据时返回None。"""
-        result = self.request_with_token_query('/openapi/versions/latest', {
+    def get_latest_version(self, model_code, part_no, purpose, program,
+                           aircraft_no='', eo_no=''):
+        """查询已发布的最新固件版本；两个编号仅在非空时传给服务器。"""
+        params = {
             'model_code': model_code,
             'part_no': part_no,
             'purpose': purpose or '',
             'program': program,
             'status': 1,
-        })
+        }
+        aircraft_no = str(aircraft_no or '').strip()
+        eo_no = str(eo_no or '').strip()
+        if aircraft_no:
+            params['aircraft_no'] = aircraft_no
+        if eo_no:
+            params['eo_no'] = eo_no
+        result = self.request_with_token_query('/openapi/versions/latest', params)
         if result is None:
             return None
         if isinstance(result, dict) and 'data' in result:
@@ -506,6 +514,7 @@ def show_firmware_selection_dialog(auth, burn_options=None):
 
     model_var, part_var = tk.StringVar(), tk.StringVar()
     purpose_var, program_var = tk.StringVar(), tk.StringVar(value='bootload')
+    aircraft_no_var, eo_no_var = tk.StringVar(), tk.StringVar()
     status_var = tk.StringVar(value='正在从服务器加载机型...')
 
     ttk.Label(frame, text='机型：').grid(row=1, column=0, sticky='e', pady=5)
@@ -521,14 +530,20 @@ def show_firmware_selection_dialog(auth, burn_options=None):
     program_box = ttk.Combobox(frame, textvariable=program_var, state='readonly',
                                values=('bootload', 'app'), width=42)
     program_box.grid(row=4, column=1, columnspan=2, sticky='ew', pady=5)
+    ttk.Label(frame, text='航空器编号：').grid(row=5, column=0, sticky='e', pady=5)
+    aircraft_no_entry = ttk.Entry(frame, textvariable=aircraft_no_var, width=44)
+    aircraft_no_entry.grid(row=5, column=1, columnspan=2, sticky='ew', pady=5)
+    ttk.Label(frame, text='EO单号：').grid(row=6, column=0, sticky='e', pady=5)
+    eo_no_entry = ttk.Entry(frame, textvariable=eo_no_var, width=44)
+    eo_no_entry.grid(row=6, column=1, columnspan=2, sticky='ew', pady=5)
 
     query_button = ttk.Button(frame, text='查询固件')
-    query_button.grid(row=5, column=1, pady=(12, 8), sticky='w')
+    query_button.grid(row=7, column=1, pady=(12, 8), sticky='w')
     ttk.Label(frame, textvariable=status_var, foreground='#555555').grid(
-        row=6, column=0, columnspan=3, pady=(2, 10))
+        row=8, column=0, columnspan=3, pady=(2, 10))
 
     info_frame = ttk.LabelFrame(frame, text='固件版本信息', padding=12)
-    info_frame.grid(row=7, column=0, columnspan=3, sticky='ew')
+    info_frame.grid(row=9, column=0, columnspan=3, sticky='ew')
     info_vars = {key: tk.StringVar(value='-') for key in
                  ('file_name', 'file_md5', 'file_size', 'version', 'burn_addr')}
     labels = [('文件名', 'file_name'), ('MD5', 'file_md5'),
@@ -540,7 +555,7 @@ def show_firmware_selection_dialog(auth, burn_options=None):
             row=row, column=1, sticky='w', pady=3)
 
     button_frame = ttk.Frame(frame)
-    button_frame.grid(row=8, column=0, columnspan=3, pady=(14, 0))
+    button_frame.grid(row=10, column=0, columnspan=3, pady=(14, 0))
     confirm_button = ttk.Button(button_frame, text='烧录', state='disabled', width=12)
     confirm_button.grid(row=0, column=0, padx=5)
     cancel_button = ttk.Button(button_frame, text='取消', width=12)
@@ -577,6 +592,8 @@ def show_firmware_selection_dialog(auth, burn_options=None):
         model_box.configure(state=widget_state)
         part_box.configure(state=widget_state)
         program_box.configure(state=widget_state)
+        aircraft_no_entry.configure(state='disabled' if busy else 'normal')
+        eo_no_entry.configure(state='disabled' if busy else 'normal')
         if purpose_box.winfo_ismapped():
             purpose_box.configure(state=widget_state)
         query_button.configure(state='disabled' if busy else 'normal')
@@ -689,12 +706,15 @@ def show_firmware_selection_dialog(auth, burn_options=None):
         set_busy(True, '正在查询最新固件...')
         selection = {'model_code': model['model_code'], 'part_no': part['part_no'],
                      'purpose': purpose_var.get().strip(), 'program': program,
-                     'status': 1, 'burn_addr': resolved_address}
+                     'status': 1, 'burn_addr': resolved_address,
+                     'aircraft_no': aircraft_no_var.get().strip(),
+                     'eo_no': eo_no_var.get().strip()}
         def worker():
             try:
                 version = auth.get_latest_version(
                     selection['model_code'], selection['part_no'],
-                    selection['purpose'], selection['program'])
+                    selection['purpose'], selection['program'],
+                    selection['aircraft_no'], selection['eo_no'])
             except Exception as exc:
                 root.after(0, lambda message=str(exc): operation_failed(message))
             else:
@@ -896,6 +916,8 @@ def show_firmware_selection_dialog(auth, burn_options=None):
     model_box.bind('<<ComboboxSelected>>', on_model_changed)
     part_box.bind('<<ComboboxSelected>>', on_part_changed)
     program_box.bind('<<ComboboxSelected>>', lambda event: clear_version())
+    aircraft_no_var.trace_add('write', lambda *_: clear_version())
+    eo_no_var.trace_add('write', lambda *_: clear_version())
     root.protocol('WM_DELETE_WINDOW', close_selection)
     root.bind('<Escape>', close_selection)
     root.update_idletasks()
@@ -938,7 +960,11 @@ def terminal_firmware_selection(auth):
         for i, value in enumerate(programs, 1):
             print(f'  {i}. {value}')
         program = programs[int(input('请选择程序编号: ')) - 1]
-        version = auth.get_latest_version(model['model_code'], part['part_no'], purpose, program)
+        aircraft_no = input('航空器编号（可留空）: ').strip()
+        eo_no = input('EO单号（可留空）: ').strip()
+        version = auth.get_latest_version(
+            model['model_code'], part['part_no'], purpose, program,
+            aircraft_no, eo_no)
     except (AuthenticationError, ValueError, IndexError) as e:
         print(f'[✗] 固件查询失败: {e}', file=sys.stderr)
         return None
