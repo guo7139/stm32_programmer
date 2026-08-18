@@ -5,7 +5,7 @@ STM32 ST-Link SWD Programmer
 """
 
 import sys, os, struct, time, argparse
-import contextlib, getpass, hashlib, json, queue, tempfile, threading, traceback
+import contextlib, getpass, hashlib, json, queue, tempfile, threading
 from pathlib import Path
 from urllib import error as urllib_error
 from urllib import request as urllib_request
@@ -740,7 +740,7 @@ def show_firmware_selection_dialog(auth, burn_options=None):
         start_burn_progress(version, burn_address)
 
     def start_burn_progress(version, burn_address):
-        """显示实时烧录日志窗口；完成后由用户手动关闭。"""
+        """显示实时烧录日志窗口；失败后可连接设备并在当前窗口重试。"""
         progress_window = tk.Toplevel(root)
         progress_window.withdraw()
         progress_window.title('STM32 ST-Link 烧录过程')
@@ -763,11 +763,16 @@ def show_firmware_selection_dialog(auth, burn_options=None):
         progress_status = tk.StringVar(value='正在准备烧录...')
         ttk.Label(progress_frame, textvariable=progress_status).pack(
             anchor='w', pady=(8, 4))
-        close_button = ttk.Button(progress_frame, text='关闭', state='disabled', width=12)
-        close_button.pack(anchor='e')
+        action_frame = ttk.Frame(progress_frame)
+        action_frame.pack(anchor='e')
+        burn_button = ttk.Button(action_frame, text='烧录', state='disabled', width=12)
+        burn_button.grid(row=0, column=0, padx=(0, 8))
+        close_button = ttk.Button(action_frame, text='关闭', state='disabled', width=12)
+        close_button.grid(row=0, column=1)
 
         messages = queue.Queue()
-        finished = {'done': False}
+        process = {'running': False, 'finished': False,
+                   'downloaded_path': None, 'success': False}
 
         class QueueWriter:
             def __init__(self, output_queue):
@@ -783,8 +788,6 @@ def show_firmware_selection_dialog(auth, burn_options=None):
 
         def append_log(text):
             log_text.configure(state='normal')
-            # 严格模拟终端回车符：\r 回到当前行行首并覆盖该行，
-            # 因此擦除、写入、校验百分比始终只占一行。
             parts = str(text).split(chr(13))
             for index, part in enumerate(parts):
                 if index:
@@ -795,7 +798,7 @@ def show_firmware_selection_dialog(auth, burn_options=None):
             log_text.configure(state='disabled')
 
         def close_progress():
-            if not finished['done']:
+            if process['running'] or not process['finished']:
                 return
             progress_window.destroy()
             state['burn_active'] = False
@@ -821,29 +824,32 @@ def show_firmware_selection_dialog(auth, burn_options=None):
             writer = QueueWriter(messages)
             programmer = None
             success = False
-            downloaded_path = None
-            failure_message = None
             try:
                 with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
-                    print('[*] 开始下载固件...')
-                    downloaded_path = auth.download_firmware(version, progress=progress)
-                    print(f'[✓] 下载完成并通过MD5、文件大小校验: {downloaded_path}')
-                    print(f'[*] 烧录地址: 0x{burn_address:08X}')
+                    if not process['downloaded_path']:
+                        print('[*] 开始下载固件...')
+                        process['downloaded_path'] = auth.download_firmware(
+                            version, progress=progress)
+                        print('[✓] 下载完成并通过MD5、文件大小校验: '
+                              f"{process['downloaded_path']}")
+                        print(f'[*] 烧录地址: 0x{burn_address:08X}')
+                    else:
+                        print(chr(10) + '[*] 重新执行 ST-Link 烧录...')
+                        print(f"[*] 使用已校验固件: {process['downloaded_path']}")
                     print('[*] 开始执行 ST-Link 烧录...')
                     programmer = STM32Programmer(
                         serial=burn_options.get('serial'),
                         index=burn_options.get('device'))
                     programmer.flash_firmware(
-                        downloaded_path, burn_address,
+                        process['downloaded_path'], burn_address,
                         burn_options.get('verify', True),
                         burn_options.get('run_after', True),
                         burn_options.get('chip'))
                 success = True
             except Exception as exc:
-                failure_message = str(exc)
+                # 用户窗口只显示可操作的错误信息，不暴露Python调用栈。
                 newline = chr(10)
                 messages.put(('log', newline + f'[✗] 烧录失败: {exc}' + newline))
-                messages.put(('log', traceback.format_exc()))
             finally:
                 if programmer is not None:
                     try:
@@ -852,17 +858,22 @@ def show_firmware_selection_dialog(auth, burn_options=None):
                         newline = chr(10)
                         messages.put(('log', newline +
                                       f'[!] 关闭ST-Link时出错: {exc}' + newline))
-                        if success:
-                            success = False
-                            failure_message = f'关闭ST-Link时出错: {exc}'
-                if success:
-                    messages.put(('finished', True,
-                                  '烧录完成，请确认日志后手动关闭窗口',
-                                  downloaded_path))
-                else:
-                    messages.put(('finished', False,
-                                  '烧录失败，请确认错误信息后手动关闭窗口',
-                                  failure_message))
+                        success = False
+                messages.put(('finished', success,
+                              ('烧录完成，请确认日志后手动关闭窗口' if success else
+                               '烧录失败；连接ST-Link后可点击“烧录”重试')))
+
+        def start_attempt():
+            if process['running'] or process['success']:
+                return
+            process['running'] = True
+            process['finished'] = False
+            burn_button.configure(state='disabled')
+            close_button.configure(state='disabled')
+            progress_status.set('正在烧录，请稍候...')
+            threading.Thread(target=worker, daemon=True).start()
+
+        burn_button.configure(command=start_attempt)
 
         def poll_messages():
             try:
@@ -873,35 +884,35 @@ def show_firmware_selection_dialog(auth, burn_options=None):
                     elif item[0] == 'status':
                         progress_status.set(item[1])
                     elif item[0] == 'finished':
-                        success, text, path = item[1], item[2], item[3]
-                        finished['done'] = True
+                        success, text = item[1], item[2]
+                        process['running'] = False
+                        process['finished'] = True
+                        process['success'] = success
                         progress_status.set(text)
                         close_button.configure(state='normal')
+                        burn_button.configure(state='disabled' if success else 'normal')
                         if success:
                             result['confirmed'] = True
                             result['burn_completed'] = True
                             result['version'] = version
-                            result['downloaded_file'] = path
+                            result['downloaded_file'] = process['downloaded_path']
                             result['burn_addr'] = burn_address
                             status_var.set('烧录完成；过程窗口等待手动关闭')
                         else:
-                            status_var.set('烧录失败；过程窗口等待手动关闭')
+                            status_var.set('烧录失败；可在过程窗口连接设备后重试')
             except queue.Empty:
                 pass
             if progress_window.winfo_exists():
                 progress_window.after(80, poll_messages)
 
-        # 完成控件布局后按屏幕尺寸居中显示，不使用系统默认左上角位置。
         progress_window.update_idletasks()
         width, height = 760, 520
         x = max((progress_window.winfo_screenwidth() - width) // 2, 0)
         y = max((progress_window.winfo_screenheight() - height) // 2, 0)
         progress_window.geometry(f'{width}x{height}+{x}+{y}')
         progress_window.deiconify()
-
-        # 不允许烧录期间关闭选择窗口；任务结束后仍由用户手动操作窗口。
         progress_window.focus_set()
-        threading.Thread(target=worker, daemon=True).start()
+        start_attempt()
         progress_window.after(80, poll_messages)
 
     def close_selection(event=None):
