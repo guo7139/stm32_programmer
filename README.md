@@ -340,8 +340,8 @@ python stm32_stlink_programmer.py --logout
 
 1. 从服务器加载“机型”；
 2. 根据机型加载“零部件”；
-3. 零部件的 `purpose` 为空时隐藏“用途”，非空时按 `|` 分割供用户选择；
-4. “程序”可选 `bootload`、`app`；
+3. 零部件的 `purpose` 为空时隐藏“芯片”，非空时按 `|` 分割供用户选择；
+4. “类型”可选 `BootLoader`、`App`，接口参数和配置文件也使用这两个值；
 5. 点击“查询固件”调用 `/openapi/versions/latest`；
 6. 查询成功后显示文件名、MD5、文件大小、版本，用户确认后才继续执行 ST-Link 操作。
 
@@ -349,7 +349,7 @@ python stm32_stlink_programmer.py --logout
 
 ### 固件下载、校验与烧录
 
-查询到固件后，界面按钮显示为“烧录”，并显示文件名、MD5、自动换算后的文件大小、版本和最终烧录地址。选择 `bootload` 时地址固定为 `0x08000000`；选择 `app` 时地址取零部件接口的 `burn_addr`。
+查询到固件后，界面按钮显示为“烧录”，并显示文件名、MD5、自动换算后的文件大小、版本和最终烧录地址。选择 `BootLoader` 时地址固定为 `0x08000000`；选择 `App` 时地址取零部件接口的 `burn_addr`。
 
 点击“烧录”后，程序执行以下安全流程：
 
@@ -358,7 +358,7 @@ python stm32_stlink_programmer.py --logout
 3. 计算下载文件的实际 MD5 和字节大小；
 4. 与版本接口返回的 `file_md5`、`file_size` 严格比较；
 5. 任一不一致时删除错误文件、显示错误并停止，不执行烧录；
-6. 校验通过后调用 ST-Link 烧录流程：`bootload` 使用 `0x08000000`，`app` 使用零部件的 `burn_addr`。
+6. 校验通过后调用 ST-Link 烧录流程：`BootLoader` 使用 `0x08000000`，`App` 使用零部件的 `burn_addr`。
 
 Windows 下载目录：
 

@@ -289,10 +289,10 @@ class AuthClient:
 
     @classmethod
     def resolve_burn_address(cls, program, part):
-        """按程序类型决定最终烧录地址：bootload固定基址，app取零部件配置。"""
-        if program == 'bootload':
+        """按程序类型决定最终烧录地址：BootLoader固定基址，App取零部件配置。"""
+        if program == 'BootLoader':
             return '0x08000000'
-        if program == 'app':
+        if program == 'App':
             address = str((part or {}).get('burn_addr') or '').strip()
             cls.parse_burn_address(address)
             return address
@@ -540,9 +540,10 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
     model_var, part_var = tk.StringVar(), tk.StringVar()
     purpose_var = tk.StringVar()
     program_options = ('BootLoader', 'App')
-    program_values = {'BootLoader': 'bootload', 'App': 'app'}
-    saved_program = saved.get('program') if saved.get('program') in ('bootload', 'app') else 'bootload'
-    program_var = tk.StringVar(value='BootLoader' if saved_program == 'bootload' else 'App')
+    saved_program = {'bootload': 'BootLoader', 'app': 'App'}.get(
+        saved.get('program'), saved.get('program'))
+    saved_program = saved_program if saved_program in program_options else 'BootLoader'
+    program_var = tk.StringVar(value=saved_program)
     status_options = ('研发验证', '已发布', '生产测试')
     saved_status = str(saved.get('status') if saved.get('status') is not None else '1')
     saved_status = saved_status if saved_status in ('0', '1', '2') else '1'
@@ -751,9 +752,8 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
         if not model or not part:
             messagebox.showwarning('查询提示', '请选择机型和零部件', parent=root)
             return
-        program_display = program_var.get().strip()
-        program = program_values.get(program_display)
-        if not program:
+        program = program_var.get().strip()
+        if program not in program_options:
             messagebox.showwarning('查询提示', '请选择类型', parent=root)
             return
         try:
@@ -1211,13 +1211,15 @@ def terminal_firmware_selection(auth, app_config=None):
                                if saved.get('purpose') in purposes else 1)
             purpose_text = input(f'请选择用途编号 [{default_purpose}]: ').strip()
             purpose = purposes[int(purpose_text or default_purpose) - 1]
-        programs = ['bootload', 'app']
-        print('程序:')
+        programs = ['BootLoader', 'App']
+        print('类型:')
         for i, value in enumerate(programs, 1):
             print(f'  {i}. {value}')
-        default_program = (programs.index(saved.get('program')) + 1
-                           if saved.get('program') in programs else 1)
-        program_text = input(f'请选择程序编号 [{default_program}]: ').strip()
+        saved_program = {'bootload': 'BootLoader', 'app': 'App'}.get(
+            saved.get('program'), saved.get('program'))
+        default_program = (programs.index(saved_program) + 1
+                           if saved_program in programs else 1)
+        program_text = input(f'请选择类型编号 [{default_program}]: ').strip()
         program = programs[int(program_text or default_program) - 1]
         status_labels = ['研发验证', '已发布', '生产测试']
         saved_status = str(saved.get('status') if saved.get('status') is not None else '1')
