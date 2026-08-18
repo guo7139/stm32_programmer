@@ -540,7 +540,10 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
     model_var, part_var = tk.StringVar(), tk.StringVar()
     purpose_var = tk.StringVar()
     program_var = tk.StringVar(value=(saved.get('program') if saved.get('program') in ('bootload', 'app') else 'bootload'))
-    status_value_var = tk.StringVar(value=str(saved.get('status') if saved.get('status') not in (None, '') else '1'))
+    status_options = ('0：研发验证', '1：已发布', '2：生产测试')
+    saved_status = str(saved.get('status') if saved.get('status') is not None else '1')
+    saved_status = saved_status if saved_status in ('0', '1', '2') else '1'
+    status_value_var = tk.StringVar(value=status_options[int(saved_status)])
     aircraft_no_var = tk.StringVar(value=str(saved.get('aircraft_no') or ''))
     eo_no_var = tk.StringVar(value=str(saved.get('eo_no') or ''))
     status_var = tk.StringVar(value='正在从服务器加载机型...')
@@ -559,8 +562,9 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
                                values=('bootload', 'app'), width=42)
     program_box.grid(row=4, column=1, columnspan=2, sticky='ew', pady=5)
     ttk.Label(frame, text='状态：').grid(row=5, column=0, sticky='e', pady=5)
-    status_entry = ttk.Entry(frame, textvariable=status_value_var, width=44)
-    status_entry.grid(row=5, column=1, columnspan=2, sticky='ew', pady=5)
+    status_box = ttk.Combobox(frame, textvariable=status_value_var,
+                              values=status_options, state='readonly', width=42)
+    status_box.grid(row=5, column=1, columnspan=2, sticky='ew', pady=5)
     ttk.Label(frame, text='航空器编号：').grid(row=6, column=0, sticky='e', pady=5)
     aircraft_no_entry = ttk.Entry(frame, textvariable=aircraft_no_var, width=44)
     aircraft_no_entry.grid(row=6, column=1, columnspan=2, sticky='ew', pady=5)
@@ -623,7 +627,7 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
         model_box.configure(state=widget_state)
         part_box.configure(state=widget_state)
         program_box.configure(state=widget_state)
-        status_entry.configure(state='disabled' if busy else 'normal')
+        status_box.configure(state=widget_state)
         aircraft_no_entry.configure(state='disabled' if busy else 'normal')
         eo_no_entry.configure(state='disabled' if busy else 'normal')
         if purpose_box.winfo_ismapped():
@@ -743,11 +747,11 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
         except AuthenticationError as exc:
             messagebox.showerror('无法查询固件', str(exc), parent=root)
             return
-        status_text = status_value_var.get().strip()
-        if not status_text:
-            messagebox.showwarning('查询提示', '请输入状态 status', parent=root)
+        status_index = status_box.current()
+        if status_index not in (0, 1, 2):
+            messagebox.showwarning('查询提示', '请选择状态', parent=root)
             return
-        status_value = int(status_text) if status_text.lstrip('+-').isdigit() else status_text
+        status_value = status_index
         clear_version()
         selection = {'model_code': model['model_code'], 'part_no': part['part_no'],
                      'purpose': purpose_var.get().strip(), 'program': program,
@@ -1043,11 +1047,16 @@ def terminal_firmware_selection(auth, app_config=None):
                            if saved.get('program') in programs else 1)
         program_text = input(f'请选择程序编号 [{default_program}]: ').strip()
         program = programs[int(program_text or default_program) - 1]
-        status_text = input(f"状态 [{saved.get('status', 1)}]: ").strip()
-        status_text = status_text or str(saved.get('status', 1))
-        if not status_text:
-            raise ValueError('状态不能为空')
-        status = int(status_text) if status_text.lstrip('+-').isdigit() else status_text
+        status_labels = ['0：研发验证', '1：已发布', '2：生产测试']
+        saved_status = str(saved.get('status') if saved.get('status') is not None else '1')
+        default_status = int(saved_status) if saved_status in ('0', '1', '2') else 1
+        print('状态:')
+        for value in status_labels:
+            print(f'  {value}')
+        status_text = input(f'请选择状态值 [{default_status}]: ').strip()
+        status = int(status_text or default_status)
+        if status not in (0, 1, 2):
+            raise ValueError('状态只能选择0、1或2')
         aircraft_no = input(
             f"航空器编号（可留空） [{saved.get('aircraft_no', '')}]: ").strip()
         aircraft_no = aircraft_no or str(saved.get('aircraft_no') or '')
