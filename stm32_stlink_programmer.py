@@ -572,8 +572,16 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
     eo_no_entry = ttk.Entry(frame, textvariable=eo_no_var, width=44)
     eo_no_entry.grid(row=7, column=1, columnspan=2, sticky='ew', pady=5)
 
-    query_button = ttk.Button(frame, text='查询固件')
-    query_button.grid(row=8, column=1, pady=(12, 8), sticky='w')
+    query_action_frame = ttk.Frame(frame)
+    query_action_frame.grid(row=8, column=1, columnspan=2,
+                            pady=(12, 8), sticky='w')
+    query_button = ttk.Button(query_action_frame, text='查询固件', width=12)
+    query_button.grid(row=0, column=0, padx=(0, 10))
+    erase_button = tk.Button(
+        query_action_frame, text='全片擦除', width=12,
+        background='#c62828', foreground='white', activebackground='#8e0000',
+        activeforeground='white', relief='raised', cursor='hand2')
+    erase_button.grid(row=0, column=1)
     ttk.Label(frame, textvariable=status_var, foreground='#555555').grid(
         row=9, column=0, columnspan=3, pady=(2, 10))
 
@@ -591,15 +599,10 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
 
     button_frame = ttk.Frame(frame)
     button_frame.grid(row=11, column=0, columnspan=3, pady=(14, 0))
-    erase_button = tk.Button(
-        button_frame, text='全片擦除', width=12,
-        background='#c62828', foreground='white', activebackground='#8e0000',
-        activeforeground='white', relief='raised', cursor='hand2')
-    erase_button.grid(row=0, column=0, padx=5)
     confirm_button = ttk.Button(button_frame, text='烧录', state='disabled', width=12)
-    confirm_button.grid(row=0, column=1, padx=5)
+    confirm_button.grid(row=0, column=0, padx=5)
     cancel_button = ttk.Button(button_frame, text='取消', width=12)
-    cancel_button.grid(row=0, column=2, padx=5)
+    cancel_button.grid(row=0, column=1, padx=5)
 
     def model_display(item):
         name = item.get('model_name') or item.get('model_code') or ''
