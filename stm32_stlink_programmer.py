@@ -730,8 +730,8 @@ def show_firmware_selection_dialog(auth, burn_options=None):
     def start_burn_progress(version, burn_address):
         """显示实时烧录日志窗口；完成后由用户手动关闭。"""
         progress_window = tk.Toplevel(root)
+        progress_window.withdraw()
         progress_window.title('STM32 ST-Link 烧录过程')
-        progress_window.geometry('760x520')
         progress_window.minsize(620, 400)
         progress_window.transient(root)
 
@@ -771,8 +771,14 @@ def show_firmware_selection_dialog(auth, burn_options=None):
 
         def append_log(text):
             log_text.configure(state='normal')
-            # 将命令行覆盖式进度转换成窗口中的可读文本。
-            log_text.insert('end', text.replace(chr(13), ''))
+            # 严格模拟终端回车符：\r 回到当前行行首并覆盖该行，
+            # 因此擦除、写入、校验百分比始终只占一行。
+            parts = str(text).split(chr(13))
+            for index, part in enumerate(parts):
+                if index:
+                    log_text.delete('end-1c linestart', 'end-1c')
+                if part:
+                    log_text.insert('end-1c', part)
             log_text.see('end')
             log_text.configure(state='disabled')
 
@@ -872,6 +878,14 @@ def show_firmware_selection_dialog(auth, burn_options=None):
                 pass
             if progress_window.winfo_exists():
                 progress_window.after(80, poll_messages)
+
+        # 完成控件布局后按屏幕尺寸居中显示，不使用系统默认左上角位置。
+        progress_window.update_idletasks()
+        width, height = 760, 520
+        x = max((progress_window.winfo_screenwidth() - width) // 2, 0)
+        y = max((progress_window.winfo_screenheight() - height) // 2, 0)
+        progress_window.geometry(f'{width}x{height}+{x}+{y}')
+        progress_window.deiconify()
 
         # 不允许烧录期间关闭选择窗口；任务结束后仍由用户手动操作窗口。
         progress_window.focus_set()
