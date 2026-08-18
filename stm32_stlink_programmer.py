@@ -264,6 +264,17 @@ class AuthClient:
             display /= 1024
         return f'{int(display)} {unit}' if unit == 'B' else f'{display:.1f} {unit}'
 
+    @classmethod
+    def resolve_burn_address(cls, program, part):
+        """按程序类型决定最终烧录地址：bootload固定基址，app取零部件配置。"""
+        if program == 'bootload':
+            return '0x08000000'
+        if program == 'app':
+            address = str((part or {}).get('burn_addr') or '').strip()
+            cls.parse_burn_address(address)
+            return address
+        raise AuthenticationError(f'不支持的程序类型：{program}')
+
     @staticmethod
     def parse_burn_address(value):
         """校验并解析零部件接口返回的烧录地址。"""
@@ -505,7 +516,7 @@ def show_firmware_selection_dialog(auth):
     purpose_box = ttk.Combobox(frame, textvariable=purpose_var, state='readonly', width=42)
     ttk.Label(frame, text='程序：').grid(row=4, column=0, sticky='e', pady=5)
     program_box = ttk.Combobox(frame, textvariable=program_var, state='readonly',
-                               values=('bootload', 'app', 'parameter'), width=42)
+                               values=('bootload', 'app'), width=42)
     program_box.grid(row=4, column=1, columnspan=2, sticky='ew', pady=5)
 
     query_button = ttk.Button(frame, text='查询固件')
@@ -666,11 +677,16 @@ def show_firmware_selection_dialog(auth):
         if not program:
             messagebox.showwarning('查询提示', '请选择程序', parent=root)
             return
+        try:
+            resolved_address = auth.resolve_burn_address(program, part)
+        except AuthenticationError as exc:
+            messagebox.showerror('无法查询固件', str(exc), parent=root)
+            return
         clear_version()
         set_busy(True, '正在查询最新固件...')
         selection = {'model_code': model['model_code'], 'part_no': part['part_no'],
                      'purpose': purpose_var.get().strip(), 'program': program,
-                     'status': 1, 'burn_addr': str(part.get('burn_addr') or '').strip()}
+                     'status': 1, 'burn_addr': resolved_address}
         def worker():
             try:
                 version = auth.get_latest_version(
@@ -782,7 +798,7 @@ def terminal_firmware_selection(auth):
             for i, value in enumerate(purposes, 1):
                 print(f'  {i}. {value}')
             purpose = purposes[int(input('请选择用途编号: ')) - 1]
-        programs = ['bootload', 'app', 'parameter']
+        programs = ['bootload', 'app']
         print('程序:')
         for i, value in enumerate(programs, 1):
             print(f'  {i}. {value}')
@@ -794,7 +810,7 @@ def terminal_firmware_selection(auth):
     if not version:
         print('[✗] 没有匹配的已发布固件', file=sys.stderr)
         return None
-    burn_addr = str(part.get('burn_addr') or '').strip()
+    burn_addr = auth.resolve_burn_address(program, part)
     print(f"文件名: {version.get('file_name', '')}")
     print(f"MD5: {version.get('file_md5', '')}")
     print(f"文件大小: {auth.format_file_size(version.get('file_size'))}")
@@ -803,7 +819,7 @@ def terminal_firmware_selection(auth):
     if input('确认下载并烧录该固件？[y/N]: ').strip().lower() not in ('y', 'yes'):
         return None
     try:
-        parsed_addr = auth.parse_burn_addr(burn_addr)
+        parsed_addr = auth.parse_burn_address(burn_addr)
         downloaded = auth.download_firmware(
             version, progress=lambda received, total:
             print(f'\r下载: {auth.format_file_size(received)} / '
