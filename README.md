@@ -322,19 +322,15 @@ api_token: <api_token>
 
 ### ST-Link 图形登录界面
 
-运行 `stm32_stlink_programmer.py` 时，如果本机尚未保存 `api_token`，程序会自动显示用户名和密码登录窗口。密码采用掩码显示，登录成功后才能执行设备列表、芯片信息、烧录、擦除和读取操作。
+每次运行 `stm32_stlink_programmer.py` 都会显示用户名和密码登录窗口。ST-Link工具的 `api_token` 仅保存在当前进程内存中，不写入 `auth.json` 或其他配置文件；启动时还会清理旧版本遗留的 `auth.json`。密码始终不保存。
+
+主程序目录中的 `stm32_programmer_config.json` 只记录非敏感配置：用户名、机型、零部件、用途、程序、状态、航空器编号和EO单号。下次启动时登录框预填用户名，固件选择页在接口数据加载完成后恢复上次选择。该配置文件不包含密码或 `api_token`。
 
 ```bash
-# 强制显示登录窗口并重新登录
-python stm32_stlink_programmer.py --login
+# 每次启动均要求登录；--username可覆盖配置中的预填用户名
+python stm32_stlink_programmer.py --username admin
 
-# 登录窗口预填用户名
-python stm32_stlink_programmer.py --login --username admin
-
-# 登录后烧录
-python stm32_stlink_programmer.py -f firmware.bin -a 0x08000000
-
-# 删除本机令牌并退出登录
+# 清除当前内存会话并退出（Token从不落盘）
 python stm32_stlink_programmer.py --logout
 ```
 
@@ -349,7 +345,7 @@ python stm32_stlink_programmer.py --logout
 5. 点击“查询固件”调用 `/openapi/versions/latest`；
 6. 查询成功后显示文件名、MD5、文件大小、版本，用户确认后才继续执行 ST-Link 操作。
 
-列表和查询接口均自动在 URL 中携带当前登录的 `api_token`，最新版本查询固定带 `status=1`。
+列表和查询接口均自动在 URL 中携带当前登录的 `api_token`。最新版本查询的 `status` 使用“固件选择”页面及配置文件中的值，不再固定为 `1`。
 
 ### 固件下载、校验与烧录
 

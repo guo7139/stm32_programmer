@@ -101,14 +101,60 @@ class AuthenticationError(Exception):
     pass
 
 
+class AppConfig:
+    """主程序目录的非敏感配置；绝不保存密码或api_token。"""
+    ALLOWED_KEYS = {
+        'username', 'model_code', 'part_no', 'purpose', 'program', 'status',
+        'aircraft_no', 'eo_no'
+    }
+
+    def __init__(self, path=None):
+        self.path = Path(path) if path else Path(__file__).resolve().parent / 'stm32_programmer_config.json'
+        self.data = self.load()
+
+    def load(self):
+        try:
+            raw = json.loads(self.path.read_text(encoding='utf-8'))
+            if not isinstance(raw, dict):
+                return {}
+            return {key: raw.get(key) for key in self.ALLOWED_KEYS if key in raw}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def update(self, **values):
+        for key, value in values.items():
+            if key in self.ALLOWED_KEYS:
+                self.data[key] = value
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(prefix='config-', suffix='.tmp', dir=str(self.path.parent))
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as output:
+                json.dump(self.data, output, ensure_ascii=False, indent=2)
+                output.write('\n')
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temp_name, self.path)
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
+
+
 class AuthClient:
-    """登录、保存api_token，并为后续HTTP接口自动携带令牌。"""
+    """登录并在当前进程内存中保存api_token；令牌绝不落盘。"""
 
     def __init__(self, server=AUTH_SERVER, timeout=AUTH_TIMEOUT):
         self.server = server.rstrip('/')
         self.timeout = timeout
         self.token_file = self._get_token_file()
-        self.api_token = self._load_token()
+        self.api_token = None
+        self.username = None
+        # 清理旧版本可能遗留的敏感Token文件，之后不再创建该文件。
+        try:
+            self.token_file.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
 
     @staticmethod
     def _get_token_file():
@@ -118,35 +164,12 @@ class AuthClient:
             base = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config'))
         return base / 'stm32_programmer' / 'auth.json'
 
-    def _load_token(self):
-        try:
-            data = json.loads(self.token_file.read_text(encoding='utf-8'))
-            token = data.get('api_token')
-            return token if isinstance(token, str) and token else None
-        except (OSError, ValueError, TypeError):
-            return None
-
-    def _save_token(self, token):
-        self.token_file.parent.mkdir(parents=True, exist_ok=True)
-        fd, temp_name = tempfile.mkstemp(prefix='auth-', suffix='.tmp',
-                                         dir=str(self.token_file.parent))
-        try:
-            with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                json.dump({'api_token': token}, f)
-            try:
-                os.chmod(temp_name, 0o600)
-            except OSError:
-                pass
-            os.replace(temp_name, self.token_file)
-        finally:
-            if os.path.exists(temp_name):
-                os.unlink(temp_name)
-
     def logout(self):
         self.api_token = None
+        self.username = None
         try:
             self.token_file.unlink()
-        except FileNotFoundError:
+        except (FileNotFoundError, OSError):
             pass
 
     def _send(self, path, method='GET', payload=None, require_token=True):
@@ -186,7 +209,7 @@ class AuthClient:
             raise AuthenticationError(
                 result.get('message') or result.get('error') or '用户名或密码错误')
         self.api_token = token
-        self._save_token(token)
+        self.username = username
         return result
 
     def request(self, path, method='GET', payload=None):
@@ -367,7 +390,7 @@ class AuthClient:
                 except OSError:
                     pass
 
-    def get_latest_version(self, model_code, part_no, purpose, program,
+    def get_latest_version(self, model_code, part_no, purpose, program, status,
                            aircraft_no='', eo_no=''):
         """查询已发布的最新固件版本；两个编号仅在非空时传给服务器。"""
         params = {
@@ -375,7 +398,7 @@ class AuthClient:
             'part_no': part_no,
             'purpose': purpose or '',
             'program': program,
-            'status': 1,
+            'status': status,
         }
         aircraft_no = str(aircraft_no or '').strip()
         eo_no = str(eo_no or '').strip()
@@ -486,17 +509,17 @@ def show_login_dialog(auth, initial_username=''):
     return result['ok']
 
 
-def show_firmware_selection_dialog(auth, burn_options=None):
+def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
     """显示机型/零部件/用途/程序选择与固件版本确认窗口。"""
     try:
         import tkinter as tk
         from tkinter import messagebox, ttk
     except ImportError:
-        return terminal_firmware_selection(auth)
+        return terminal_firmware_selection(auth, app_config)
     try:
         root = tk.Tk()
     except tk.TclError:
-        return terminal_firmware_selection(auth)
+        return terminal_firmware_selection(auth, app_config)
 
     root.title('STM32 ST-Link 烧录工具 - 固件选择')
     root.resizable(False, False)
@@ -504,8 +527,10 @@ def show_firmware_selection_dialog(auth, burn_options=None):
               'downloaded_file': None, 'burn_addr': None,
               'gui_managed': True, 'burn_completed': False}
     burn_options = burn_options or {}
+    app_config = app_config or AppConfig()
+    saved = dict(app_config.data)
     state = {'models': [], 'parts': [], 'initial_records': [], 'version': None,
-             'burn_active': False}
+             'burn_active': False, 'restoring': True}
 
     frame = ttk.Frame(root, padding=20)
     frame.grid(row=0, column=0, sticky='nsew')
@@ -513,8 +538,11 @@ def show_firmware_selection_dialog(auth, burn_options=None):
         row=0, column=0, columnspan=3, pady=(0, 14))
 
     model_var, part_var = tk.StringVar(), tk.StringVar()
-    purpose_var, program_var = tk.StringVar(), tk.StringVar(value='bootload')
-    aircraft_no_var, eo_no_var = tk.StringVar(), tk.StringVar()
+    purpose_var = tk.StringVar()
+    program_var = tk.StringVar(value=(saved.get('program') if saved.get('program') in ('bootload', 'app') else 'bootload'))
+    status_value_var = tk.StringVar(value=str(saved.get('status') if saved.get('status') not in (None, '') else '1'))
+    aircraft_no_var = tk.StringVar(value=str(saved.get('aircraft_no') or ''))
+    eo_no_var = tk.StringVar(value=str(saved.get('eo_no') or ''))
     status_var = tk.StringVar(value='正在从服务器加载机型...')
 
     ttk.Label(frame, text='机型：').grid(row=1, column=0, sticky='e', pady=5)
@@ -530,20 +558,23 @@ def show_firmware_selection_dialog(auth, burn_options=None):
     program_box = ttk.Combobox(frame, textvariable=program_var, state='readonly',
                                values=('bootload', 'app'), width=42)
     program_box.grid(row=4, column=1, columnspan=2, sticky='ew', pady=5)
-    ttk.Label(frame, text='航空器编号：').grid(row=5, column=0, sticky='e', pady=5)
+    ttk.Label(frame, text='状态：').grid(row=5, column=0, sticky='e', pady=5)
+    status_entry = ttk.Entry(frame, textvariable=status_value_var, width=44)
+    status_entry.grid(row=5, column=1, columnspan=2, sticky='ew', pady=5)
+    ttk.Label(frame, text='航空器编号：').grid(row=6, column=0, sticky='e', pady=5)
     aircraft_no_entry = ttk.Entry(frame, textvariable=aircraft_no_var, width=44)
-    aircraft_no_entry.grid(row=5, column=1, columnspan=2, sticky='ew', pady=5)
-    ttk.Label(frame, text='EO单号：').grid(row=6, column=0, sticky='e', pady=5)
+    aircraft_no_entry.grid(row=6, column=1, columnspan=2, sticky='ew', pady=5)
+    ttk.Label(frame, text='EO单号：').grid(row=7, column=0, sticky='e', pady=5)
     eo_no_entry = ttk.Entry(frame, textvariable=eo_no_var, width=44)
-    eo_no_entry.grid(row=6, column=1, columnspan=2, sticky='ew', pady=5)
+    eo_no_entry.grid(row=7, column=1, columnspan=2, sticky='ew', pady=5)
 
     query_button = ttk.Button(frame, text='查询固件')
-    query_button.grid(row=7, column=1, pady=(12, 8), sticky='w')
+    query_button.grid(row=8, column=1, pady=(12, 8), sticky='w')
     ttk.Label(frame, textvariable=status_var, foreground='#555555').grid(
-        row=8, column=0, columnspan=3, pady=(2, 10))
+        row=9, column=0, columnspan=3, pady=(2, 10))
 
     info_frame = ttk.LabelFrame(frame, text='固件版本信息', padding=12)
-    info_frame.grid(row=9, column=0, columnspan=3, sticky='ew')
+    info_frame.grid(row=10, column=0, columnspan=3, sticky='ew')
     info_vars = {key: tk.StringVar(value='-') for key in
                  ('file_name', 'file_md5', 'file_size', 'version', 'burn_addr')}
     labels = [('文件名', 'file_name'), ('MD5', 'file_md5'),
@@ -555,7 +586,7 @@ def show_firmware_selection_dialog(auth, burn_options=None):
             row=row, column=1, sticky='w', pady=3)
 
     button_frame = ttk.Frame(frame)
-    button_frame.grid(row=10, column=0, columnspan=3, pady=(14, 0))
+    button_frame.grid(row=11, column=0, columnspan=3, pady=(14, 0))
     confirm_button = ttk.Button(button_frame, text='烧录', state='disabled', width=12)
     confirm_button.grid(row=0, column=0, padx=5)
     cancel_button = ttk.Button(button_frame, text='取消', width=12)
@@ -592,6 +623,7 @@ def show_firmware_selection_dialog(auth, burn_options=None):
         model_box.configure(state=widget_state)
         part_box.configure(state=widget_state)
         program_box.configure(state=widget_state)
+        status_entry.configure(state='disabled' if busy else 'normal')
         aircraft_no_entry.configure(state='disabled' if busy else 'normal')
         eo_no_entry.configure(state='disabled' if busy else 'normal')
         if purpose_box.winfo_ismapped():
@@ -600,10 +632,11 @@ def show_firmware_selection_dialog(auth, burn_options=None):
         if message:
             status_var.set(message)
 
-    def show_purpose(part):
+    def show_purpose(part, preferred=''):
         raw = str((part or {}).get('purpose') or '').strip()
         purposes = [value.strip() for value in raw.split('|') if value.strip()]
-        purpose_var.set(purposes[0] if purposes else '')
+        purpose_var.set(preferred if preferred in purposes else
+                        (purposes[0] if purposes else ''))
         purpose_box.configure(values=purposes)
         if purposes:
             purpose_label.grid(row=3, column=0, sticky='e', pady=5)
@@ -616,13 +649,18 @@ def show_firmware_selection_dialog(auth, burn_options=None):
         state['parts'] = parts
         part_box.configure(values=[part_display(item) for item in parts])
         if parts:
-            part_box.current(0)
-            show_purpose(parts[0])
+            target_no = str(saved.get('part_no') or '') if state['restoring'] else ''
+            index = next((i for i, item in enumerate(parts)
+                          if str(item.get('part_no') or '') == target_no), 0)
+            part_box.current(index)
+            preferred_purpose = str(saved.get('purpose') or '') if state['restoring'] else ''
+            show_purpose(parts[index], preferred_purpose)
             status_var.set(f'已加载 {len(parts)} 个零部件')
         else:
             part_var.set('')
             show_purpose(None)
             status_var.set('该机型没有可选零部件')
+        state['restoring'] = False
         set_busy(False)
 
     def operation_failed(message):
@@ -657,7 +695,10 @@ def show_firmware_selection_dialog(auth, burn_options=None):
             status_var.set('服务器未返回机型数据')
             messagebox.showwarning('没有机型', '服务器未返回可选机型', parent=root)
             return
-        model_box.current(0)
+        target_code = str(saved.get('model_code') or '')
+        index = next((i for i, item in enumerate(models)
+                      if str(item.get('model_code') or '') == target_code), 0)
+        model_box.current(index)
         on_model_changed()
 
     def load_data():
@@ -702,18 +743,32 @@ def show_firmware_selection_dialog(auth, burn_options=None):
         except AuthenticationError as exc:
             messagebox.showerror('无法查询固件', str(exc), parent=root)
             return
+        status_text = status_value_var.get().strip()
+        if not status_text:
+            messagebox.showwarning('查询提示', '请输入状态 status', parent=root)
+            return
+        status_value = int(status_text) if status_text.lstrip('+-').isdigit() else status_text
         clear_version()
-        set_busy(True, '正在查询最新固件...')
         selection = {'model_code': model['model_code'], 'part_no': part['part_no'],
                      'purpose': purpose_var.get().strip(), 'program': program,
-                     'status': 1, 'burn_addr': resolved_address,
+                     'status': status_value, 'burn_addr': resolved_address,
                      'aircraft_no': aircraft_no_var.get().strip(),
                      'eo_no': eo_no_var.get().strip()}
+        try:
+            app_config.update(**{
+                key: selection[key] for key in
+                ('model_code', 'part_no', 'purpose', 'program', 'status',
+                 'aircraft_no', 'eo_no')
+            })
+        except OSError as exc:
+            messagebox.showerror('配置保存失败', str(exc), parent=root)
+            return
+        set_busy(True, '正在查询最新固件...')
         def worker():
             try:
                 version = auth.get_latest_version(
                     selection['model_code'], selection['part_no'],
-                    selection['purpose'], selection['program'],
+                    selection['purpose'], selection['program'], selection['status'],
                     selection['aircraft_no'], selection['eo_no'])
             except Exception as exc:
                 root.after(0, lambda message=str(exc): operation_failed(message))
@@ -927,6 +982,7 @@ def show_firmware_selection_dialog(auth, burn_options=None):
     model_box.bind('<<ComboboxSelected>>', on_model_changed)
     part_box.bind('<<ComboboxSelected>>', on_part_changed)
     program_box.bind('<<ComboboxSelected>>', lambda event: clear_version())
+    status_value_var.trace_add('write', lambda *_: clear_version())
     aircraft_no_var.trace_add('write', lambda *_: clear_version())
     eo_no_var.trace_add('write', lambda *_: clear_version())
     root.protocol('WM_DELETE_WINDOW', close_selection)
@@ -940,8 +996,10 @@ def show_firmware_selection_dialog(auth, burn_options=None):
     return result if result['confirmed'] else None
 
 
-def terminal_firmware_selection(auth):
+def terminal_firmware_selection(auth, app_config=None):
     """无图形环境时的固件选择流程。"""
+    app_config = app_config or AppConfig()
+    saved = app_config.data
     try:
         models, records = auth.get_models_and_parts()
         if not models:
@@ -950,7 +1008,11 @@ def terminal_firmware_selection(auth):
         print('机型:')
         for i, item in enumerate(models, 1):
             print(f"  {i}. {item['model_code']} - {item.get('model_name', '')}")
-        model = models[int(input('请选择机型编号: ')) - 1]
+        default_model = next((i for i, item in enumerate(models, 1)
+                              if str(item.get('model_code') or '') ==
+                              str(saved.get('model_code') or '')), 1)
+        model_text = input(f'请选择机型编号 [{default_model}]: ').strip()
+        model = models[int(model_text or default_model) - 1]
         parts = auth.get_parts(model['model_code'], records)
         if not parts:
             print('[✗] 该机型没有可选零部件', file=sys.stderr)
@@ -958,23 +1020,45 @@ def terminal_firmware_selection(auth):
         print('零部件:')
         for i, item in enumerate(parts, 1):
             print(f"  {i}. {item['part_no']} - {item.get('part_name', '')}")
-        part = parts[int(input('请选择零部件编号: ')) - 1]
+        default_part = next((i for i, item in enumerate(parts, 1)
+                             if str(item.get('part_no') or '') ==
+                             str(saved.get('part_no') or '')), 1)
+        part_text = input(f'请选择零部件编号 [{default_part}]: ').strip()
+        part = parts[int(part_text or default_part) - 1]
         purposes = [v.strip() for v in str(part.get('purpose') or '').split('|') if v.strip()]
         purpose = ''
         if purposes:
             print('用途:')
             for i, value in enumerate(purposes, 1):
                 print(f'  {i}. {value}')
-            purpose = purposes[int(input('请选择用途编号: ')) - 1]
+            default_purpose = (purposes.index(saved.get('purpose')) + 1
+                               if saved.get('purpose') in purposes else 1)
+            purpose_text = input(f'请选择用途编号 [{default_purpose}]: ').strip()
+            purpose = purposes[int(purpose_text or default_purpose) - 1]
         programs = ['bootload', 'app']
         print('程序:')
         for i, value in enumerate(programs, 1):
             print(f'  {i}. {value}')
-        program = programs[int(input('请选择程序编号: ')) - 1]
-        aircraft_no = input('航空器编号（可留空）: ').strip()
-        eo_no = input('EO单号（可留空）: ').strip()
+        default_program = (programs.index(saved.get('program')) + 1
+                           if saved.get('program') in programs else 1)
+        program_text = input(f'请选择程序编号 [{default_program}]: ').strip()
+        program = programs[int(program_text or default_program) - 1]
+        status_text = input(f"状态 [{saved.get('status', 1)}]: ").strip()
+        status_text = status_text or str(saved.get('status', 1))
+        if not status_text:
+            raise ValueError('状态不能为空')
+        status = int(status_text) if status_text.lstrip('+-').isdigit() else status_text
+        aircraft_no = input(
+            f"航空器编号（可留空） [{saved.get('aircraft_no', '')}]: ").strip()
+        aircraft_no = aircraft_no or str(saved.get('aircraft_no') or '')
+        eo_no = input(f"EO单号（可留空） [{saved.get('eo_no', '')}]: ").strip()
+        eo_no = eo_no or str(saved.get('eo_no') or '')
+        app_config.update(
+            model_code=model['model_code'], part_no=part['part_no'],
+            purpose=purpose, program=program, status=status,
+            aircraft_no=aircraft_no, eo_no=eo_no)
         version = auth.get_latest_version(
-            model['model_code'], part['part_no'], purpose, program,
+            model['model_code'], part['part_no'], purpose, program, status,
             aircraft_no, eo_no)
     except (AuthenticationError, ValueError, IndexError) as e:
         print(f'[✗] 固件查询失败: {e}', file=sys.stderr)
@@ -1002,7 +1086,8 @@ def terminal_firmware_selection(auth):
         return None
     return {'confirmed': True,
             'selection': {'model_code': model['model_code'], 'part_no': part['part_no'],
-                          'purpose': purpose, 'program': program, 'status': 1},
+                          'purpose': purpose, 'program': program, 'status': status,
+                          'aircraft_no': aircraft_no, 'eo_no': eo_no},
             'version': version, 'downloaded_file': downloaded,
             'burn_addr': parsed_addr}
 
@@ -2007,29 +2092,33 @@ def main():
     parser.add_argument('-l', '--list', action='store_true', help='列出所有ST-Link设备')
     args = parser.parse_args()
     auth = AuthClient()
+    app_config = AppConfig()
 
     if args.logout:
         auth.logout()
-        print("[✓] 已退出登录，本机api_token已删除")
+        print("[✓] 已退出当前会话；api_token未保存到本机")
         return
 
-    # --login 强制显示登录界面；没有令牌时，任何软件功能都先要求登录。
-    if args.login or not auth.api_token:
-        if args.login:
-            auth.logout()
-        if not show_login_dialog(auth, args.username or ''):
-            print("[✗] 未登录，软件不能使用", file=sys.stderr)
-            sys.exit(1)
-        print("[✓] 登录成功，已获得使用权限")
+    # 每次启动都必须登录；仅从普通配置中预填用户名，Token只保存在内存。
+    initial_username = args.username or str(app_config.data.get('username') or '')
+    if not show_login_dialog(auth, initial_username):
+        print("[✗] 未登录，软件不能使用", file=sys.stderr)
+        sys.exit(1)
+    try:
+        app_config.update(username=auth.username or initial_username)
+    except OSError as exc:
+        print(f"[✗] 无法保存用户名配置: {exc}", file=sys.stderr)
+        sys.exit(1)
+    print("[✓] 登录成功，已获得使用权限")
 
-    # 登录后必须选择并确认服务器上的固件版本。
+    # 登录后选择服务器上的固件版本，并恢复上次非敏感选择配置。
     firmware_choice = show_firmware_selection_dialog(auth, {
         'serial': args.serial,
         'device': args.device,
         'verify': not args.no_verify,
         'run_after': not args.no_run,
         'chip': args.chip,
-    })
+    }, app_config)
     if not firmware_choice:
         print("[✗] 未确认固件，操作已取消", file=sys.stderr)
         sys.exit(1)

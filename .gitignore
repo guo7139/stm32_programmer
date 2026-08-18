@@ -20,3 +20,6 @@ cur_diag.py
 
 # 本地登录令牌（正常保存于系统用户配置目录，防止误提交）
 auth.json
+
+# ST-Link本机非敏感选择配置（含用户名和业务选择，不提交仓库）
+stm32_programmer_config.json
