@@ -540,7 +540,7 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
     model_var, part_var = tk.StringVar(), tk.StringVar()
     purpose_var = tk.StringVar()
     program_var = tk.StringVar(value=(saved.get('program') if saved.get('program') in ('bootload', 'app') else 'bootload'))
-    status_options = ('0：研发验证', '1：已发布', '2：生产测试')
+    status_options = ('研发验证', '已发布', '生产测试')
     saved_status = str(saved.get('status') if saved.get('status') is not None else '1')
     saved_status = saved_status if saved_status in ('0', '1', '2') else '1'
     status_value_var = tk.StringVar(value=status_options[int(saved_status)])
@@ -557,7 +557,7 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
 
     purpose_label = ttk.Label(frame, text='用途：')
     purpose_box = ttk.Combobox(frame, textvariable=purpose_var, state='readonly', width=42)
-    ttk.Label(frame, text='程序：').grid(row=4, column=0, sticky='e', pady=5)
+    ttk.Label(frame, text='类型：').grid(row=4, column=0, sticky='e', pady=5)
     program_box = ttk.Combobox(frame, textvariable=program_var, state='readonly',
                                values=('bootload', 'app'), width=42)
     program_box.grid(row=4, column=1, columnspan=2, sticky='ew', pady=5)
@@ -1047,12 +1047,12 @@ def terminal_firmware_selection(auth, app_config=None):
                            if saved.get('program') in programs else 1)
         program_text = input(f'请选择程序编号 [{default_program}]: ').strip()
         program = programs[int(program_text or default_program) - 1]
-        status_labels = ['0：研发验证', '1：已发布', '2：生产测试']
+        status_labels = ['研发验证', '已发布', '生产测试']
         saved_status = str(saved.get('status') if saved.get('status') is not None else '1')
         default_status = int(saved_status) if saved_status in ('0', '1', '2') else 1
         print('状态:')
-        for value in status_labels:
-            print(f'  {value}')
+        for index, value in enumerate(status_labels):
+            print(f'  {index}. {value}')
         status_text = input(f'请选择状态值 [{default_status}]: ').strip()
         status = int(status_text or default_status)
         if status not in (0, 1, 2):
