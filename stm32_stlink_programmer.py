@@ -574,14 +574,15 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
 
     query_action_frame = ttk.Frame(frame)
     query_action_frame.grid(row=8, column=1, columnspan=2,
-                            pady=(12, 8), sticky='w')
+                            pady=(12, 8), sticky='ew')
+    query_action_frame.columnconfigure(1, weight=1)
     query_button = ttk.Button(query_action_frame, text='查询固件', width=12)
-    query_button.grid(row=0, column=0, padx=(0, 10))
+    query_button.grid(row=0, column=0, sticky='w')
     erase_button = tk.Button(
         query_action_frame, text='全片擦除', width=12,
         background='#c62828', foreground='white', activebackground='#8e0000',
         activeforeground='white', relief='raised', cursor='hand2')
-    erase_button.grid(row=0, column=1)
+    erase_button.grid(row=0, column=1, sticky='e')
     ttk.Label(frame, textvariable=status_var, foreground='#555555').grid(
         row=9, column=0, columnspan=3, pady=(2, 10))
 
