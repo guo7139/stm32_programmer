@@ -539,7 +539,10 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
 
     model_var, part_var = tk.StringVar(), tk.StringVar()
     purpose_var = tk.StringVar()
-    program_var = tk.StringVar(value=(saved.get('program') if saved.get('program') in ('bootload', 'app') else 'bootload'))
+    program_options = ('BootLoader', 'App')
+    program_values = {'BootLoader': 'bootload', 'App': 'app'}
+    saved_program = saved.get('program') if saved.get('program') in ('bootload', 'app') else 'bootload'
+    program_var = tk.StringVar(value='BootLoader' if saved_program == 'bootload' else 'App')
     status_options = ('研发验证', '已发布', '生产测试')
     saved_status = str(saved.get('status') if saved.get('status') is not None else '1')
     saved_status = saved_status if saved_status in ('0', '1', '2') else '1'
@@ -559,7 +562,7 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
     purpose_box = ttk.Combobox(frame, textvariable=purpose_var, state='readonly', width=42)
     ttk.Label(frame, text='类型：').grid(row=4, column=0, sticky='e', pady=5)
     program_box = ttk.Combobox(frame, textvariable=program_var, state='readonly',
-                               values=('bootload', 'app'), width=42)
+                               values=program_options, width=42)
     program_box.grid(row=4, column=1, columnspan=2, sticky='ew', pady=5)
     ttk.Label(frame, text='状态：').grid(row=5, column=0, sticky='e', pady=5)
     status_box = ttk.Combobox(frame, textvariable=status_value_var,
@@ -748,9 +751,10 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
         if not model or not part:
             messagebox.showwarning('查询提示', '请选择机型和零部件', parent=root)
             return
-        program = program_var.get().strip()
+        program_display = program_var.get().strip()
+        program = program_values.get(program_display)
         if not program:
-            messagebox.showwarning('查询提示', '请选择程序', parent=root)
+            messagebox.showwarning('查询提示', '请选择类型', parent=root)
             return
         try:
             resolved_address = auth.resolve_burn_address(program, part)
