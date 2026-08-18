@@ -5,7 +5,7 @@ STM32 ST-Link SWD Programmer
 """
 
 import sys, os, struct, time, argparse
-import getpass, hashlib, json, tempfile, threading
+import contextlib, getpass, hashlib, json, queue, tempfile, threading, traceback
 from pathlib import Path
 from urllib import error as urllib_error
 from urllib import request as urllib_request
@@ -478,7 +478,7 @@ def show_login_dialog(auth, initial_username=''):
     return result['ok']
 
 
-def show_firmware_selection_dialog(auth):
+def show_firmware_selection_dialog(auth, burn_options=None):
     """显示机型/零部件/用途/程序选择与固件版本确认窗口。"""
     try:
         import tkinter as tk
@@ -493,8 +493,11 @@ def show_firmware_selection_dialog(auth):
     root.title('STM32 ST-Link 烧录工具 - 固件选择')
     root.resizable(False, False)
     result = {'confirmed': False, 'selection': None, 'version': None,
-              'downloaded_file': None, 'burn_addr': None}
-    state = {'models': [], 'parts': [], 'initial_records': [], 'version': None}
+              'downloaded_file': None, 'burn_addr': None,
+              'gui_managed': True, 'burn_completed': False}
+    burn_options = burn_options or {}
+    state = {'models': [], 'parts': [], 'initial_records': [], 'version': None,
+             'burn_active': False}
 
     frame = ttk.Frame(root, padding=20)
     frame.grid(row=0, column=0, sticky='nsew')
@@ -540,8 +543,8 @@ def show_firmware_selection_dialog(auth):
     button_frame.grid(row=8, column=0, columnspan=3, pady=(14, 0))
     confirm_button = ttk.Button(button_frame, text='烧录', state='disabled', width=12)
     confirm_button.grid(row=0, column=0, padx=5)
-    ttk.Button(button_frame, text='取消', command=root.destroy, width=12).grid(
-        row=0, column=1, padx=5)
+    cancel_button = ttk.Button(button_frame, text='取消', width=12)
+    cancel_button.grid(row=0, column=1, padx=5)
 
     def model_display(item):
         name = item.get('model_name') or item.get('model_code') or ''
@@ -722,47 +725,173 @@ def show_firmware_selection_dialog(auth):
                 f"烧录地址：{burn_addr}\n\n确认下载并烧录该固件？",
                 parent=root):
             return
-        set_busy(True, '正在下载并校验固件...')
+        start_burn_progress(version, burn_address)
+
+    def start_burn_progress(version, burn_address):
+        """显示实时烧录日志窗口；完成后由用户手动关闭。"""
+        progress_window = tk.Toplevel(root)
+        progress_window.title('STM32 ST-Link 烧录过程')
+        progress_window.geometry('760x520')
+        progress_window.minsize(620, 400)
+        progress_window.transient(root)
+
+        progress_frame = ttk.Frame(progress_window, padding=12)
+        progress_frame.pack(fill='both', expand=True)
+        ttk.Label(progress_frame, text='烧录过程', font=('', 15, 'bold')).pack(
+            anchor='w', pady=(0, 8))
+        log_frame = ttk.Frame(progress_frame)
+        log_frame.pack(fill='both', expand=True)
+        log_text = tk.Text(log_frame, wrap='word', state='disabled',
+                           font=('Consolas', 10), background='#101820',
+                           foreground='#e8f1f2', insertbackground='white')
+        scrollbar = ttk.Scrollbar(log_frame, orient='vertical', command=log_text.yview)
+        log_text.configure(yscrollcommand=scrollbar.set)
+        log_text.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+        progress_status = tk.StringVar(value='正在准备烧录...')
+        ttk.Label(progress_frame, textvariable=progress_status).pack(
+            anchor='w', pady=(8, 4))
+        close_button = ttk.Button(progress_frame, text='关闭', state='disabled', width=12)
+        close_button.pack(anchor='e')
+
+        messages = queue.Queue()
+        finished = {'done': False}
+
+        class QueueWriter:
+            def __init__(self, output_queue):
+                self.output_queue = output_queue
+            def write(self, text):
+                if text:
+                    self.output_queue.put(('log', str(text)))
+                return len(text or '')
+            def flush(self):
+                return None
+            def isatty(self):
+                return False
+
+        def append_log(text):
+            log_text.configure(state='normal')
+            # 将命令行覆盖式进度转换成窗口中的可读文本。
+            log_text.insert('end', text.replace(chr(13), ''))
+            log_text.see('end')
+            log_text.configure(state='disabled')
+
+        def close_progress():
+            if not finished['done']:
+                return
+            progress_window.destroy()
+            state['burn_active'] = False
+            set_busy(False)
+            cancel_button.configure(state='normal')
+            confirm_button.configure(state='normal' if state['version'] else 'disabled')
+            status_var.set('烧录流程已结束，可重新选择或再次烧录')
+
+        close_button.configure(command=close_progress)
+        progress_window.protocol('WM_DELETE_WINDOW', close_progress)
+        state['burn_active'] = True
+        set_busy(True, '正在下载、校验并烧录固件...')
         confirm_button.configure(state='disabled')
+        cancel_button.configure(state='disabled')
 
         def progress(received, expected):
             if expected > 0:
-                text = f'正在下载固件... {received * 100 // expected}%'
+                messages.put(('status', f'正在下载固件... {received * 100 // expected}%'))
             else:
-                text = f'正在下载固件... {auth.format_file_size(received)}'
-            root.after(0, lambda value=text: status_var.set(value))
+                messages.put(('status', f'正在下载固件... {auth.format_file_size(received)}'))
 
         def worker():
+            writer = QueueWriter(messages)
+            programmer = None
+            success = False
+            downloaded_path = None
+            failure_message = None
             try:
-                downloaded = auth.download_firmware(version, progress=progress)
+                with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
+                    print('[*] 开始下载固件...')
+                    downloaded_path = auth.download_firmware(version, progress=progress)
+                    print(f'[✓] 下载完成并通过MD5、文件大小校验: {downloaded_path}')
+                    print(f'[*] 烧录地址: 0x{burn_address:08X}')
+                    print('[*] 开始执行 ST-Link 烧录...')
+                    programmer = STM32Programmer(
+                        serial=burn_options.get('serial'),
+                        index=burn_options.get('device'))
+                    programmer.flash_firmware(
+                        downloaded_path, burn_address,
+                        burn_options.get('verify', True),
+                        burn_options.get('run_after', True),
+                        burn_options.get('chip'))
+                success = True
             except Exception as exc:
-                root.after(0, lambda message=str(exc): download_failed(message))
-            else:
-                root.after(0, lambda path=downloaded, address=burn_address:
-                           download_succeeded(path, address))
+                failure_message = str(exc)
+                newline = chr(10)
+                messages.put(('log', newline + f'[✗] 烧录失败: {exc}' + newline))
+                messages.put(('log', traceback.format_exc()))
+            finally:
+                if programmer is not None:
+                    try:
+                        programmer.close()
+                    except Exception as exc:
+                        newline = chr(10)
+                        messages.put(('log', newline +
+                                      f'[!] 关闭ST-Link时出错: {exc}' + newline))
+                        if success:
+                            success = False
+                            failure_message = f'关闭ST-Link时出错: {exc}'
+                if success:
+                    messages.put(('finished', True,
+                                  '烧录完成，请确认日志后手动关闭窗口',
+                                  downloaded_path))
+                else:
+                    messages.put(('finished', False,
+                                  '烧录失败，请确认错误信息后手动关闭窗口',
+                                  failure_message))
+
+        def poll_messages():
+            try:
+                while True:
+                    item = messages.get_nowait()
+                    if item[0] == 'log':
+                        append_log(item[1])
+                    elif item[0] == 'status':
+                        progress_status.set(item[1])
+                    elif item[0] == 'finished':
+                        success, text, path = item[1], item[2], item[3]
+                        finished['done'] = True
+                        progress_status.set(text)
+                        close_button.configure(state='normal')
+                        if success:
+                            result['confirmed'] = True
+                            result['burn_completed'] = True
+                            result['version'] = version
+                            result['downloaded_file'] = path
+                            result['burn_addr'] = burn_address
+                            status_var.set('烧录完成；过程窗口等待手动关闭')
+                        else:
+                            status_var.set('烧录失败；过程窗口等待手动关闭')
+            except queue.Empty:
+                pass
+            if progress_window.winfo_exists():
+                progress_window.after(80, poll_messages)
+
+        # 不允许烧录期间关闭选择窗口；任务结束后仍由用户手动操作窗口。
+        progress_window.focus_set()
         threading.Thread(target=worker, daemon=True).start()
+        progress_window.after(80, poll_messages)
 
-    def download_failed(message):
-        set_busy(False)
-        confirm_button.configure(state='normal')
-        status_var.set('固件下载或校验失败，未执行烧录')
-        messagebox.showerror('固件文件错误', message, parent=root)
-
-    def download_succeeded(path, burn_addr):
-        result['confirmed'] = True
-        result['version'] = state['version']
-        result['downloaded_file'] = path
-        result['burn_addr'] = burn_addr
-        status_var.set('下载和校验成功，准备烧录...')
-        root.after(100, root.destroy)
+    def close_selection(event=None):
+        if state['burn_active']:
+            messagebox.showwarning('正在烧录', '烧录过程尚未结束，暂时不能关闭窗口', parent=root)
+            return
+        root.destroy()
 
     query_button.configure(command=query_version)
     confirm_button.configure(command=confirm)
+    cancel_button.configure(command=close_selection)
     model_box.bind('<<ComboboxSelected>>', on_model_changed)
     part_box.bind('<<ComboboxSelected>>', on_part_changed)
     program_box.bind('<<ComboboxSelected>>', lambda event: clear_version())
-    root.protocol('WM_DELETE_WINDOW', root.destroy)
-    root.bind('<Escape>', lambda event: root.destroy())
+    root.protocol('WM_DELETE_WINDOW', close_selection)
+    root.bind('<Escape>', close_selection)
     root.update_idletasks()
     x = max((root.winfo_screenwidth() - root.winfo_width()) // 2, 0)
     y = max((root.winfo_screenheight() - root.winfo_height()) // 2, 0)
@@ -1851,7 +1980,13 @@ def main():
         print("[✓] 登录成功，已获得使用权限")
 
     # 登录后必须选择并确认服务器上的固件版本。
-    firmware_choice = show_firmware_selection_dialog(auth)
+    firmware_choice = show_firmware_selection_dialog(auth, {
+        'serial': args.serial,
+        'device': args.device,
+        'verify': not args.no_verify,
+        'run_after': not args.no_run,
+        'chip': args.chip,
+    })
     if not firmware_choice:
         print("[✗] 未确认固件，操作已取消", file=sys.stderr)
         sys.exit(1)
@@ -1859,6 +1994,9 @@ def main():
     version = firmware_choice['version']
     downloaded_file = firmware_choice.get('downloaded_file')
     burn_addr = firmware_choice.get('burn_addr')
+    # 图形界面已在烧录过程窗口中完成下载、校验和烧录，禁止主流程重复烧录。
+    if firmware_choice.get('gui_managed'):
+        return
     print(f"[✓] 固件下载校验通过: {version.get('file_name', '')} "
           f"({version.get('version', '')})")
     print(f"[*] 烧录文件: {downloaded_file}")
