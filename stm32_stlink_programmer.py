@@ -555,7 +555,7 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
     part_box = ttk.Combobox(frame, textvariable=part_var, state='readonly', width=42)
     part_box.grid(row=2, column=1, columnspan=2, sticky='ew', pady=5)
 
-    purpose_label = ttk.Label(frame, text='用途：')
+    purpose_label = ttk.Label(frame, text='芯片：')
     purpose_box = ttk.Combobox(frame, textvariable=purpose_var, state='readonly', width=42)
     ttk.Label(frame, text='类型：').grid(row=4, column=0, sticky='e', pady=5)
     program_box = ttk.Combobox(frame, textvariable=program_var, state='readonly',
