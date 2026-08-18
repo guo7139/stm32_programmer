@@ -982,19 +982,12 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
 
     def start_mass_erase():
         """执行与命令行-e/--erase相同的连接和全片擦除流程。"""
-        first = messagebox.askyesno(
+        confirmed = messagebox.askyesno(
             '全片擦除警告',
             '全片擦除将删除目标芯片中的全部Flash数据。\n\n'
             '该操作不可撤销，请谨慎操作。是否继续？',
             icon='warning', parent=root, default='no')
-        if not first:
-            return
-        second = messagebox.askyesno(
-            '再次确认全片擦除',
-            '请再次确认：目标设备、ST-Link连接和芯片型号均正确。\n\n'
-            '执行后全部Flash数据将永久丢失，是否确认执行？',
-            icon='warning', parent=root, default='no')
-        if not second:
+        if not confirmed:
             return
         show_mass_erase_progress()
 
@@ -1025,11 +1018,18 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
         progress_status = tk.StringVar(value='正在连接ST-Link并执行全片擦除...')
         ttk.Label(progress_frame, textvariable=progress_status).pack(
             anchor='w', pady=(8, 4))
-        close_button = ttk.Button(progress_frame, text='关闭', state='disabled', width=12)
-        close_button.pack(anchor='e')
+        action_frame = ttk.Frame(progress_frame)
+        action_frame.pack(anchor='e')
+        retry_erase_button = tk.Button(
+            action_frame, text='全片擦除', width=12, state='disabled',
+            background='#c62828', foreground='white', activebackground='#8e0000',
+            activeforeground='white', relief='raised', cursor='hand2')
+        retry_erase_button.grid(row=0, column=0, padx=(0, 8))
+        close_button = ttk.Button(action_frame, text='关闭', state='disabled', width=12)
+        close_button.grid(row=0, column=1)
 
         messages = queue.Queue()
-        process = {'running': True, 'finished': False}
+        process = {'running': False, 'finished': False, 'success': False}
 
         class QueueWriter:
             def write(self, text):
@@ -1070,7 +1070,8 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
             success = False
             try:
                 with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
-                    print('[!] 即将执行全片擦除，全部Flash数据将被删除...')
+                    print('\n[*] 开始执行全片擦除...')
+                    print('[!] 全部Flash数据将被永久删除...')
                     programmer = STM32Programmer(
                         serial=burn_options.get('serial'),
                         index=burn_options.get('device'))
@@ -1089,6 +1090,18 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
                         success = False
                 messages.put(('finished', success))
 
+        def start_attempt():
+            if process['running'] or process['success']:
+                return
+            process['running'] = True
+            process['finished'] = False
+            retry_erase_button.configure(state='disabled')
+            close_button.configure(state='disabled')
+            progress_status.set('正在连接ST-Link并执行全片擦除...')
+            threading.Thread(target=worker, daemon=True).start()
+
+        retry_erase_button.configure(command=start_attempt)
+
         def poll_messages():
             try:
                 while True:
@@ -1099,13 +1112,16 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
                         success = item[1]
                         process['running'] = False
                         process['finished'] = True
+                        process['success'] = success
                         progress_status.set(
                             '全片擦除完成，请确认日志后关闭窗口' if success else
-                            '全片擦除失败，请检查连接和日志')
+                            '全片擦除失败；连接好设备后可点击“全片擦除”重试')
+                        retry_erase_button.configure(
+                            state='disabled' if success else 'normal')
                         close_button.configure(state='normal')
                         status_var.set(
                             '全片擦除完成；过程窗口等待手动关闭' if success else
-                            '全片擦除失败；请检查过程窗口日志')
+                            '全片擦除失败；可在过程窗口连接设备后重试')
             except queue.Empty:
                 pass
             if progress_window.winfo_exists():
@@ -1118,7 +1134,7 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
         progress_window.geometry(f'{width}x{height}+{x}+{y}')
         progress_window.deiconify()
         progress_window.focus_set()
-        threading.Thread(target=worker, daemon=True).start()
+        start_attempt()
         progress_window.after(80, poll_messages)
 
     def close_selection(event=None):
