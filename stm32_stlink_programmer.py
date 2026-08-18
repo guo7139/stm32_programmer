@@ -505,7 +505,7 @@ def show_firmware_selection_dialog(auth, burn_options=None):
         row=0, column=0, columnspan=3, pady=(0, 14))
 
     model_var, part_var = tk.StringVar(), tk.StringVar()
-    purpose_var, program_var = tk.StringVar(), tk.StringVar(value='app')
+    purpose_var, program_var = tk.StringVar(), tk.StringVar(value='bootload')
     status_var = tk.StringVar(value='正在从服务器加载机型...')
 
     ttk.Label(frame, text='机型：').grid(row=1, column=0, sticky='e', pady=5)
@@ -716,15 +716,7 @@ def show_firmware_selection_dialog(auth, burn_options=None):
         if not str(version.get('file_md5') or '').strip():
             messagebox.showerror('无法下载', '固件MD5为空，不能下载和烧录', parent=root)
             return
-        if not messagebox.askyesno(
-                '确认烧录',
-                f"文件名：{version.get('file_name', '')}\n"
-                f"MD5：{version.get('file_md5', '')}\n"
-                f"文件大小：{auth.format_file_size(version.get('file_size'))}\n"
-                f"版本：{version.get('version', '')}\n"
-                f"烧录地址：{burn_addr}\n\n确认下载并烧录该固件？",
-                parent=root):
-            return
+        # 用户点击“烧录”后直接进入烧录过程，不再二次确认。
         start_burn_progress(version, burn_address)
 
     def start_burn_progress(version, burn_address):
