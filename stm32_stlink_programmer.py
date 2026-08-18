@@ -591,10 +591,15 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
 
     button_frame = ttk.Frame(frame)
     button_frame.grid(row=11, column=0, columnspan=3, pady=(14, 0))
+    erase_button = tk.Button(
+        button_frame, text='全片擦除', width=12,
+        background='#c62828', foreground='white', activebackground='#8e0000',
+        activeforeground='white', relief='raised', cursor='hand2')
+    erase_button.grid(row=0, column=0, padx=5)
     confirm_button = ttk.Button(button_frame, text='烧录', state='disabled', width=12)
-    confirm_button.grid(row=0, column=0, padx=5)
+    confirm_button.grid(row=0, column=1, padx=5)
     cancel_button = ttk.Button(button_frame, text='取消', width=12)
-    cancel_button.grid(row=0, column=1, padx=5)
+    cancel_button.grid(row=0, column=2, padx=5)
 
     def model_display(item):
         name = item.get('model_name') or item.get('model_code') or ''
@@ -633,6 +638,7 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
         if purpose_box.winfo_ismapped():
             purpose_box.configure(state=widget_state)
         query_button.configure(state='disabled' if busy else 'normal')
+        erase_button.configure(state='disabled' if busy else 'normal')
         if message:
             status_var.set(message)
 
@@ -974,13 +980,155 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
         start_attempt()
         progress_window.after(80, poll_messages)
 
+    def start_mass_erase():
+        """执行与命令行-e/--erase相同的连接和全片擦除流程。"""
+        first = messagebox.askyesno(
+            '全片擦除警告',
+            '全片擦除将删除目标芯片中的全部Flash数据。\n\n'
+            '该操作不可撤销，请谨慎操作。是否继续？',
+            icon='warning', parent=root, default='no')
+        if not first:
+            return
+        second = messagebox.askyesno(
+            '再次确认全片擦除',
+            '请再次确认：目标设备、ST-Link连接和芯片型号均正确。\n\n'
+            '执行后全部Flash数据将永久丢失，是否确认执行？',
+            icon='warning', parent=root, default='no')
+        if not second:
+            return
+        show_mass_erase_progress()
+
+    def show_mass_erase_progress():
+        progress_window = tk.Toplevel(root)
+        progress_window.withdraw()
+        progress_window.title('STM32 ST-Link 全片擦除过程')
+        progress_window.minsize(620, 400)
+        progress_window.transient(root)
+
+        progress_frame = ttk.Frame(progress_window, padding=12)
+        progress_frame.pack(fill='both', expand=True)
+        ttk.Label(progress_frame, text='全片擦除过程',
+                  font=('', 15, 'bold'), foreground='#c62828').pack(
+                      anchor='w', pady=(0, 8))
+        ttk.Label(progress_frame,
+                  text='警告：该操作将永久删除目标芯片中的全部Flash数据。',
+                  foreground='#c62828').pack(anchor='w', pady=(0, 8))
+        log_frame = ttk.Frame(progress_frame)
+        log_frame.pack(fill='both', expand=True)
+        log_text = tk.Text(log_frame, wrap='word', state='disabled',
+                           font=('Consolas', 10), background='#101820',
+                           foreground='#e8f1f2', insertbackground='white')
+        scrollbar = ttk.Scrollbar(log_frame, orient='vertical', command=log_text.yview)
+        log_text.configure(yscrollcommand=scrollbar.set)
+        log_text.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+        progress_status = tk.StringVar(value='正在连接ST-Link并执行全片擦除...')
+        ttk.Label(progress_frame, textvariable=progress_status).pack(
+            anchor='w', pady=(8, 4))
+        close_button = ttk.Button(progress_frame, text='关闭', state='disabled', width=12)
+        close_button.pack(anchor='e')
+
+        messages = queue.Queue()
+        process = {'running': True, 'finished': False}
+
+        class QueueWriter:
+            def write(self, text):
+                if text:
+                    messages.put(('log', str(text)))
+                return len(text or '')
+            def flush(self):
+                return None
+            def isatty(self):
+                return False
+
+        def append_log(text):
+            log_text.configure(state='normal')
+            log_text.insert('end', str(text))
+            log_text.see('end')
+            log_text.configure(state='disabled')
+
+        def close_progress():
+            if process['running'] or not process['finished']:
+                return
+            progress_window.destroy()
+            state['burn_active'] = False
+            set_busy(False)
+            cancel_button.configure(state='normal')
+            confirm_button.configure(state='normal' if state['version'] else 'disabled')
+            status_var.set('全片擦除流程已结束，可继续选择固件')
+
+        close_button.configure(command=close_progress)
+        progress_window.protocol('WM_DELETE_WINDOW', close_progress)
+        state['burn_active'] = True
+        set_busy(True, '正在执行全片擦除，请勿断开设备或电源...')
+        confirm_button.configure(state='disabled')
+        cancel_button.configure(state='disabled')
+
+        def worker():
+            writer = QueueWriter()
+            programmer = None
+            success = False
+            try:
+                with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
+                    print('[!] 即将执行全片擦除，全部Flash数据将被删除...')
+                    programmer = STM32Programmer(
+                        serial=burn_options.get('serial'),
+                        index=burn_options.get('device'))
+                    # 与命令行-e/--erase分支执行路径一致。
+                    programmer.connect(force_chip=burn_options.get('chip'))
+                    programmer.mass_erase()
+                success = True
+            except Exception as exc:
+                messages.put(('log', f'\n[✗] 全片擦除失败: {exc}\n'))
+            finally:
+                if programmer is not None:
+                    try:
+                        programmer.close()
+                    except Exception as exc:
+                        messages.put(('log', f'\n[!] 关闭ST-Link时出错: {exc}\n'))
+                        success = False
+                messages.put(('finished', success))
+
+        def poll_messages():
+            try:
+                while True:
+                    item = messages.get_nowait()
+                    if item[0] == 'log':
+                        append_log(item[1])
+                    elif item[0] == 'finished':
+                        success = item[1]
+                        process['running'] = False
+                        process['finished'] = True
+                        progress_status.set(
+                            '全片擦除完成，请确认日志后关闭窗口' if success else
+                            '全片擦除失败，请检查连接和日志')
+                        close_button.configure(state='normal')
+                        status_var.set(
+                            '全片擦除完成；过程窗口等待手动关闭' if success else
+                            '全片擦除失败；请检查过程窗口日志')
+            except queue.Empty:
+                pass
+            if progress_window.winfo_exists():
+                progress_window.after(80, poll_messages)
+
+        progress_window.update_idletasks()
+        width, height = 760, 520
+        x = max((progress_window.winfo_screenwidth() - width) // 2, 0)
+        y = max((progress_window.winfo_screenheight() - height) // 2, 0)
+        progress_window.geometry(f'{width}x{height}+{x}+{y}')
+        progress_window.deiconify()
+        progress_window.focus_set()
+        threading.Thread(target=worker, daemon=True).start()
+        progress_window.after(80, poll_messages)
+
     def close_selection(event=None):
         if state['burn_active']:
-            messagebox.showwarning('正在烧录', '烧录过程尚未结束，暂时不能关闭窗口', parent=root)
+            messagebox.showwarning('设备操作进行中', '烧录或全片擦除尚未结束，暂时不能关闭窗口', parent=root)
             return
         root.destroy()
 
     query_button.configure(command=query_version)
+    erase_button.configure(command=start_mass_erase)
     confirm_button.configure(command=confirm)
     cancel_button.configure(command=close_selection)
     model_box.bind('<<ComboboxSelected>>', on_model_changed)
