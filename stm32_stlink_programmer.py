@@ -148,6 +148,7 @@ class AuthClient:
         self.token_file = self._get_token_file()
         self.api_token = None
         self.username = None
+        self.user_id = None
         # 清理旧版本可能遗留的敏感Token文件，之后不再创建该文件。
         try:
             self.token_file.unlink()
@@ -167,6 +168,7 @@ class AuthClient:
     def logout(self):
         self.api_token = None
         self.username = None
+        self.user_id = None
         try:
             self.token_file.unlink()
         except (FileNotFoundError, OSError):
@@ -210,6 +212,7 @@ class AuthClient:
                 result.get('message') or result.get('error') or '用户名或密码错误')
         self.api_token = token
         self.username = username
+        self.user_id = result.get('id')
         return result
 
     def request(self, path, method='GET', payload=None):
@@ -224,6 +227,22 @@ class AuthClient:
         query['token'] = self.api_token
         separator = '&' if '?' in path else '?'
         return self.request(path + separator + urllib_parse.urlencode(query))
+
+    def submit_burn_record(self, version_id, success):
+        """提交一次网络固件烧录尝试的结果。"""
+        if self.user_id in (None, ''):
+            raise AuthenticationError('登录结果缺少用户id，无法提交烧录记录')
+        if version_id in (None, ''):
+            raise AuthenticationError('固件版本缺少id，无法提交烧录记录')
+        query = urllib_parse.urlencode({'token': self.api_token})
+        return self.request(
+            '/openapi/burn-records?' + query,
+            method='POST',
+            payload={
+                'user_id': self.user_id,
+                'version_id': version_id,
+                'success': bool(success),
+            })
 
     @staticmethod
     def _as_list(result):
@@ -897,6 +916,7 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
             writer = QueueWriter(messages)
             programmer = None
             success = False
+            burn_attempted = False
             try:
                 with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
                     if not process['downloaded_path']:
@@ -913,6 +933,7 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
                     programmer = STM32Programmer(
                         serial=burn_options.get('serial'),
                         index=burn_options.get('device'))
+                    burn_attempted = True
                     programmer.flash_firmware(
                         process['downloaded_path'], burn_address,
                         burn_options.get('verify', True),
@@ -932,6 +953,12 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
                         messages.put(('log', newline +
                                       f'[!] 关闭ST-Link时出错: {exc}' + newline))
                         success = False
+                if burn_attempted:
+                    try:
+                        auth.submit_burn_record(version.get('id'), success)
+                        messages.put(('log', '[✓] 烧录记录提交成功\n'))
+                    except Exception as exc:
+                        messages.put(('log', f'[!] 烧录记录提交失败: {exc}\n'))
                 messages.put(('finished', success,
                               ('烧录完成，请确认日志后手动关闭窗口' if success else
                                '烧录失败；连接ST-Link后可点击“烧录”重试')))
@@ -2331,12 +2358,16 @@ def main():
     # 用户点击“烧录”后，服务器下载并校验通过的文件优先用于烧录；
     # 等效于: python stm32_stlink_programmer.py -f 下载文件 -a 烧录地址
     prog = STM32Programmer(serial=args.serial, index=args.device)
+    network_burn_attempted = False
+    network_burn_success = False
     try:
         if downloaded_file:
             if not os.path.isfile(downloaded_file):
                 raise STM32Error(f"下载的固件文件不存在: {downloaded_file}")
+            network_burn_attempted = True
             prog.flash_firmware(downloaded_file, burn_addr,
                                 not args.no_verify, not args.no_run, args.chip)
+            network_burn_success = True
         elif args.firmware:
             if not os.path.isfile(args.firmware):
                 raise STM32Error(f"文件不存在: {args.firmware}")
@@ -2370,6 +2401,12 @@ def main():
         sys.exit(130)
     finally:
         prog.close()
+        if network_burn_attempted:
+            try:
+                auth.submit_burn_record(version.get('id'), network_burn_success)
+                print('[✓] 烧录记录提交成功')
+            except Exception as exc:
+                print(f'[!] 烧录记录提交失败: {exc}', file=sys.stderr)
 
 
 if __name__ == '__main__':
