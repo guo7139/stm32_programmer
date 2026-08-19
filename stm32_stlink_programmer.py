@@ -255,6 +255,10 @@ class AuthClient:
                 continue
         return [item for item in STATUS_OPTIONS if item[0] in allowed]
 
+    def can_use_after_sales(self):
+        """只有登录权限中的JSON布尔值true才允许使用售后筛选。"""
+        return self.api_limit.get('after_sales') is True
+
     def submit_burn_record(self, version_id, success):
         """提交一次网络固件烧录尝试的结果。"""
         if self.user_id in (None, ''):
@@ -603,8 +607,11 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
     status_label = next((label for value, label in status_items
                          if value == selected_status), '')
     status_value_var = tk.StringVar(value=status_label)
-    aircraft_no_var = tk.StringVar(value=str(saved.get('aircraft_no') or ''))
-    eo_no_var = tk.StringVar(value=str(saved.get('eo_no') or ''))
+    after_sales_allowed = auth.can_use_after_sales()
+    aircraft_no_var = tk.StringVar(
+        value=str(saved.get('aircraft_no') or '') if after_sales_allowed else '')
+    eo_no_var = tk.StringVar(
+        value=str(saved.get('eo_no') or '') if after_sales_allowed else '')
     status_var = tk.StringVar(value='正在从服务器加载机型...')
 
     ttk.Label(frame, text='机型：').grid(row=1, column=0, sticky='e', pady=5)
@@ -624,15 +631,19 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
     status_box = ttk.Combobox(frame, textvariable=status_value_var,
                               values=status_options, state='readonly', width=42)
     status_box.grid(row=5, column=1, columnspan=2, sticky='ew', pady=5)
-    ttk.Label(frame, text='航空器编号：').grid(row=6, column=0, sticky='e', pady=5)
+    aircraft_no_label = ttk.Label(frame, text='航空器编号：')
     aircraft_no_entry = ttk.Entry(frame, textvariable=aircraft_no_var, width=44)
-    aircraft_no_entry.grid(row=6, column=1, columnspan=2, sticky='ew', pady=5)
-    ttk.Label(frame, text='EO单号：').grid(row=7, column=0, sticky='e', pady=5)
+    eo_no_label = ttk.Label(frame, text='EO单号：')
     eo_no_entry = ttk.Entry(frame, textvariable=eo_no_var, width=44)
-    eo_no_entry.grid(row=7, column=1, columnspan=2, sticky='ew', pady=5)
+    if after_sales_allowed:
+        aircraft_no_label.grid(row=6, column=0, sticky='e', pady=5)
+        aircraft_no_entry.grid(row=6, column=1, columnspan=2, sticky='ew', pady=5)
+        eo_no_label.grid(row=7, column=0, sticky='e', pady=5)
+        eo_no_entry.grid(row=7, column=1, columnspan=2, sticky='ew', pady=5)
 
+    action_row = 8 if after_sales_allowed else 6
     query_action_frame = ttk.Frame(frame)
-    query_action_frame.grid(row=8, column=1, columnspan=2,
+    query_action_frame.grid(row=action_row, column=1, columnspan=2,
                             pady=(12, 8), sticky='ew')
     query_action_frame.columnconfigure(1, weight=1)
     query_button = ttk.Button(query_action_frame, text='查询固件', width=12)
@@ -643,10 +654,10 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
         activeforeground='white', relief='raised', cursor='hand2')
     erase_button.grid(row=0, column=1, sticky='e')
     ttk.Label(frame, textvariable=status_var, foreground='#555555').grid(
-        row=9, column=0, columnspan=3, pady=(2, 10))
+        row=action_row + 1, column=0, columnspan=3, pady=(2, 10))
 
     info_frame = ttk.LabelFrame(frame, text='固件版本信息', padding=12)
-    info_frame.grid(row=10, column=0, columnspan=3, sticky='ew')
+    info_frame.grid(row=action_row + 2, column=0, columnspan=3, sticky='ew')
     info_vars = {key: tk.StringVar(value='-') for key in
                  ('file_name', 'file_md5', 'file_size', 'version', 'burn_addr')}
     labels = [('文件名', 'file_name'), ('MD5', 'file_md5'),
@@ -658,7 +669,7 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
             row=row, column=1, sticky='w', pady=3)
 
     button_frame = ttk.Frame(frame)
-    button_frame.grid(row=11, column=0, columnspan=3, pady=(14, 0))
+    button_frame.grid(row=action_row + 3, column=0, columnspan=3, pady=(14, 0))
     confirm_button = ttk.Button(button_frame, text='烧录', state='disabled', width=12)
     confirm_button.grid(row=0, column=0, padx=5)
     cancel_button = ttk.Button(button_frame, text='取消', width=12)
@@ -825,8 +836,10 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
         selection = {'model_code': model['model_code'], 'part_no': part['part_no'],
                      'purpose': purpose_var.get().strip(), 'program': program,
                      'status': status_value, 'burn_addr': resolved_address,
-                     'aircraft_no': aircraft_no_var.get().strip(),
-                     'eo_no': eo_no_var.get().strip()}
+                     'aircraft_no': (aircraft_no_var.get().strip()
+                                     if after_sales_allowed else ''),
+                     'eo_no': (eo_no_var.get().strip()
+                               if after_sales_allowed else '')}
         try:
             app_config.update(**{
                 key: selection[key] for key in
@@ -1303,11 +1316,15 @@ def terminal_firmware_selection(auth, app_config=None):
         status = int(status_text or default_status)
         if status not in allowed_status_values:
             raise ValueError('所选状态不在当前用户权限范围内')
-        aircraft_no = input(
-            f"航空器编号（可留空） [{saved.get('aircraft_no', '')}]: ").strip()
-        aircraft_no = aircraft_no or str(saved.get('aircraft_no') or '')
-        eo_no = input(f"EO单号（可留空） [{saved.get('eo_no', '')}]: ").strip()
-        eo_no = eo_no or str(saved.get('eo_no') or '')
+        if auth.can_use_after_sales():
+            aircraft_no = input(
+                f"航空器编号（可留空） [{saved.get('aircraft_no', '')}]: ").strip()
+            aircraft_no = aircraft_no or str(saved.get('aircraft_no') or '')
+            eo_no = input(f"EO单号（可留空） [{saved.get('eo_no', '')}]: ").strip()
+            eo_no = eo_no or str(saved.get('eo_no') or '')
+        else:
+            aircraft_no = ''
+            eo_no = ''
         app_config.update(
             model_code=model['model_code'], part_no=part['part_no'],
             purpose=purpose, program=program, status=status,
