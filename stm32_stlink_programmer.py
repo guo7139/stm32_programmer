@@ -44,6 +44,8 @@ STLINK_PIDS = [STLINK_V2_PID, STLINK_V21_PID, STLINK_V3_PID]
 AUTH_SERVER = "http://192.168.60.241:9100"
 AUTH_LOGIN_PATH = "/api/login"
 AUTH_TIMEOUT = 10
+PROGRAM_OPTIONS = ('BootLoader', 'App', 'Parameter')
+STATUS_OPTIONS = ((0, '研发验证'), (1, '局方批准'), (2, '生产测试'))
 
 CMD_GET_VERSION = 0xF1
 CMD_DEBUG = 0xF2
@@ -149,6 +151,7 @@ class AuthClient:
         self.api_token = None
         self.username = None
         self.user_id = None
+        self.api_limit = {}
         # 清理旧版本可能遗留的敏感Token文件，之后不再创建该文件。
         try:
             self.token_file.unlink()
@@ -169,6 +172,7 @@ class AuthClient:
         self.api_token = None
         self.username = None
         self.user_id = None
+        self.api_limit = {}
         try:
             self.token_file.unlink()
         except (FileNotFoundError, OSError):
@@ -213,6 +217,8 @@ class AuthClient:
         self.api_token = token
         self.username = username
         self.user_id = result.get('id')
+        limits = result.get('api_limit')
+        self.api_limit = limits if isinstance(limits, dict) else {}
         return result
 
     def request(self, path, method='GET', payload=None):
@@ -227,6 +233,27 @@ class AuthClient:
         query['token'] = self.api_token
         separator = '&' if '?' in path else '?'
         return self.request(path + separator + urllib_parse.urlencode(query))
+
+    def allowed_programs(self):
+        """按登录角色权限返回类型；权限数组为空表示不限制。"""
+        values = self.api_limit.get('program') or []
+        if not isinstance(values, (list, tuple)) or not values:
+            return list(PROGRAM_OPTIONS)
+        allowed = {str(value).strip() for value in values}
+        return [value for value in PROGRAM_OPTIONS if value in allowed]
+
+    def allowed_statuses(self):
+        """按登录角色权限返回状态(value, label)；权限数组为空表示不限制。"""
+        values = self.api_limit.get('status') or []
+        if not isinstance(values, (list, tuple)) or not values:
+            return list(STATUS_OPTIONS)
+        allowed = set()
+        for value in values:
+            try:
+                allowed.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        return [item for item in STATUS_OPTIONS if item[0] in allowed]
 
     def submit_burn_record(self, version_id, success):
         """提交一次网络固件烧录尝试的结果。"""
@@ -308,10 +335,10 @@ class AuthClient:
 
     @classmethod
     def resolve_burn_address(cls, program, part):
-        """按程序类型决定最终烧录地址：BootLoader固定基址，App取零部件配置。"""
+        """按程序类型决定最终烧录地址：BootLoader固定基址，App/Parameter取零部件配置。"""
         if program == 'BootLoader':
             return '0x08000000'
-        if program == 'App':
+        if program in ('App', 'Parameter'):
             address = str((part or {}).get('burn_addr') or '').strip()
             cls.parse_burn_address(address)
             return address
@@ -529,7 +556,7 @@ def show_login_dialog(auth, initial_username=''):
 
 
 def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
-    """显示机型/零部件/用途/程序选择与固件版本确认窗口。"""
+    """显示机型/零部件/芯片/类型选择与固件版本确认窗口。"""
     try:
         import tkinter as tk
         from tkinter import messagebox, ttk
@@ -558,15 +585,24 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
 
     model_var, part_var = tk.StringVar(), tk.StringVar()
     purpose_var = tk.StringVar()
-    program_options = ('BootLoader', 'App')
+    program_options = tuple(auth.allowed_programs())
+    status_items = tuple(auth.allowed_statuses())
+    status_options = tuple(label for _, label in status_items)
     saved_program = {'bootload': 'BootLoader', 'app': 'App'}.get(
         saved.get('program'), saved.get('program'))
-    saved_program = saved_program if saved_program in program_options else 'BootLoader'
+    saved_program = (saved_program if saved_program in program_options else
+                     (program_options[0] if program_options else ''))
     program_var = tk.StringVar(value=saved_program)
-    status_options = ('研发验证', '已发布', '生产测试')
-    saved_status = str(saved.get('status') if saved.get('status') is not None else '1')
-    saved_status = saved_status if saved_status in ('0', '1', '2') else '1'
-    status_value_var = tk.StringVar(value=status_options[int(saved_status)])
+    try:
+        saved_status = int(saved.get('status', 1))
+    except (TypeError, ValueError):
+        saved_status = 1
+    status_values = [value for value, _ in status_items]
+    selected_status = (saved_status if saved_status in status_values else
+                       (status_values[0] if status_values else None))
+    status_label = next((label for value, label in status_items
+                         if value == selected_status), '')
+    status_value_var = tk.StringVar(value=status_label)
     aircraft_no_var = tk.StringVar(value=str(saved.get('aircraft_no') or ''))
     eo_no_var = tk.StringVar(value=str(saved.get('eo_no') or ''))
     status_var = tk.StringVar(value='正在从服务器加载机型...')
@@ -754,7 +790,7 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
         if not version:
             clear_version()
             status_var.set('未查询到匹配固件')
-            messagebox.showinfo('查询结果', '没有匹配的已发布固件', parent=root)
+            messagebox.showinfo('查询结果', '没有匹配的固件', parent=root)
             return
         state['version'] = version
         size = version.get('file_size')
@@ -781,10 +817,10 @@ def show_firmware_selection_dialog(auth, burn_options=None, app_config=None):
             messagebox.showerror('无法查询固件', str(exc), parent=root)
             return
         status_index = status_box.current()
-        if status_index not in (0, 1, 2):
+        if status_index < 0 or status_index >= len(status_items):
             messagebox.showwarning('查询提示', '请选择状态', parent=root)
             return
-        status_value = status_index
+        status_value = status_items[status_index][0]
         clear_version()
         selection = {'model_code': model['model_code'], 'part_no': part['part_no'],
                      'purpose': purpose_var.get().strip(), 'program': program,
@@ -1238,7 +1274,9 @@ def terminal_firmware_selection(auth, app_config=None):
                                if saved.get('purpose') in purposes else 1)
             purpose_text = input(f'请选择用途编号 [{default_purpose}]: ').strip()
             purpose = purposes[int(purpose_text or default_purpose) - 1]
-        programs = ['BootLoader', 'App']
+        programs = auth.allowed_programs()
+        if not programs:
+            raise AuthenticationError('当前用户没有可用的固件类型权限')
         print('类型:')
         for i, value in enumerate(programs, 1):
             print(f'  {i}. {value}')
@@ -1248,16 +1286,23 @@ def terminal_firmware_selection(auth, app_config=None):
                            if saved_program in programs else 1)
         program_text = input(f'请选择类型编号 [{default_program}]: ').strip()
         program = programs[int(program_text or default_program) - 1]
-        status_labels = ['研发验证', '已发布', '生产测试']
-        saved_status = str(saved.get('status') if saved.get('status') is not None else '1')
-        default_status = int(saved_status) if saved_status in ('0', '1', '2') else 1
+        status_items = auth.allowed_statuses()
+        if not status_items:
+            raise AuthenticationError('当前用户没有可用的固件状态权限')
+        allowed_status_values = [value for value, _ in status_items]
+        try:
+            saved_status = int(saved.get('status', 1))
+        except (TypeError, ValueError):
+            saved_status = 1
+        default_status = (saved_status if saved_status in allowed_status_values
+                          else allowed_status_values[0])
         print('状态:')
-        for index, value in enumerate(status_labels):
-            print(f'  {index}. {value}')
+        for value, label in status_items:
+            print(f'  {value}. {label}')
         status_text = input(f'请选择状态值 [{default_status}]: ').strip()
         status = int(status_text or default_status)
-        if status not in (0, 1, 2):
-            raise ValueError('状态只能选择0、1或2')
+        if status not in allowed_status_values:
+            raise ValueError('所选状态不在当前用户权限范围内')
         aircraft_no = input(
             f"航空器编号（可留空） [{saved.get('aircraft_no', '')}]: ").strip()
         aircraft_no = aircraft_no or str(saved.get('aircraft_no') or '')
